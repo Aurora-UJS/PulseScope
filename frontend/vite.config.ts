@@ -1,7 +1,32 @@
 import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
+import react from '@vitejs/plugin-react'
+import path from 'path'
 
-// https://vite.dev/config/
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [react()],
+  root: path.resolve(__dirname, '..'),
+  publicDir: 'public',
+  server: {
+    port: 3000,
+    proxy: {
+      '/ws': {
+        target: 'ws://localhost:5000',
+        ws: true
+      }
+    }
+  },
+  build: {
+    outDir: 'dist',
+    rollupOptions: {
+      external: ['react', 'react-dom', 'lucide-react', 'recharts']
+    }
+  },
+  optimizeDeps: {
+    exclude: ['react', 'react-dom', 'lucide-react', 'recharts']
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, '..')
+    }
+  }
 })

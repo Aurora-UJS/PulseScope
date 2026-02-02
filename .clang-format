@@ -1,8 +1,0 @@
-BasedOnStyle: LLVM
-IndentWidth: 4
-ColumnLimit: 100
-AllowShortFunctionsOnASingleLine: None
-FixNamespaceComments: true
-Standard: Latest
-# Clang-format-19 specific or compatible options
-SeparateDefinitionBlocks: Always

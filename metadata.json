@@ -1,0 +1,5 @@
+
+{
+  "name": "Vision-Monitor-Pro",
+  "description": "A high-performance, modular robotics monitoring dashboard (Upper Computer) designed for real-time visualization of C++ vision algorithms via a decoupled SHM-Go architecture."
+}
