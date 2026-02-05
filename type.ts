@@ -43,3 +43,28 @@ export interface LogEntry {
   message: string;
   time: string;
 }
+
+// Dynamic Data System Types
+export interface DataPoint {
+  timestamp: number;
+  value: number;
+}
+
+export interface WSMetadataMessage {
+  type: 'metadata';
+  available_series: string[];
+}
+
+export interface WSDataMessage {
+  type: 'data';
+  timestamp: number;
+  series: Record<string, number>;
+}
+
+export type WSMessage = WSMetadataMessage | WSDataMessage;
+
+export interface DataContextType {
+  availableSeries: string[];
+  timeSeriesData: Map<string, DataPoint[]>;
+  isConnected: boolean;
+}

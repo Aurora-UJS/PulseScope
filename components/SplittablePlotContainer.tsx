@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
-import { SplitSquareHorizontal, SplitSquareVertical, X } from 'lucide-react';
-import TelemetryChart from './TelemetryChart';
-import { TelemetryPoint } from '../type';
+import { SplitSquareHorizontal, SplitSquareVertical, X, Trash2 } from 'lucide-react';
+import DynamicChart from './DynamicChart';
+import { getSeriesColor } from './DataSeriesList';
 
 interface PanelNode {
     id: string;
@@ -9,18 +9,16 @@ interface PanelNode {
     direction?: 'horizontal' | 'vertical';
     children?: PanelNode[];
     ratio?: number;
-}
-
-interface Props {
-    data: TelemetryPoint[];
+    selectedSeries?: string[];
 }
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-const SplittablePlotContainer: React.FC<Props> = ({ data }) => {
+const SplittablePlotContainer: React.FC = () => {
     const [rootPanel, setRootPanel] = useState<PanelNode>({
         id: generateId(),
-        type: 'leaf'
+        type: 'leaf',
+        selectedSeries: []
     });
 
     const splitPanel = useCallback((panelId: string, direction: 'horizontal' | 'vertical') => {
@@ -31,8 +29,8 @@ const SplittablePlotContainer: React.FC<Props> = ({ data }) => {
                     type: 'split',
                     direction,
                     children: [
-                        { id: node.id, type: 'leaf' },
-                        { id: generateId(), type: 'leaf' }
+                        { id: node.id, type: 'leaf', selectedSeries: node.selectedSeries || [] },
+                        { id: generateId(), type: 'leaf', selectedSeries: [] }
                     ],
                     ratio: 0.5
                 };
@@ -73,9 +71,41 @@ const SplittablePlotContainer: React.FC<Props> = ({ data }) => {
 
         setRootPanel(prev => {
             const result = removeNode(prev);
-            // 至少保留一个面板
-            return result || { id: generateId(), type: 'leaf' };
+            return result || { id: generateId(), type: 'leaf', selectedSeries: [] };
         });
+    }, []);
+
+    const addSeriesToPanel = useCallback((panelId: string, seriesKey: string) => {
+        const updateNode = (node: PanelNode): PanelNode => {
+            if (node.id === panelId && node.type === 'leaf') {
+                const current = node.selectedSeries || [];
+                if (!current.includes(seriesKey)) {
+                    return { ...node, selectedSeries: [...current, seriesKey] };
+                }
+                return node;
+            }
+            if (node.type === 'split' && node.children) {
+                return { ...node, children: node.children.map(child => updateNode(child)) };
+            }
+            return node;
+        };
+        setRootPanel(prev => updateNode(prev));
+    }, []);
+
+    const removeSeriesFromPanel = useCallback((panelId: string, seriesKey: string) => {
+        const updateNode = (node: PanelNode): PanelNode => {
+            if (node.id === panelId && node.type === 'leaf') {
+                return {
+                    ...node,
+                    selectedSeries: (node.selectedSeries || []).filter(k => k !== seriesKey)
+                };
+            }
+            if (node.type === 'split' && node.children) {
+                return { ...node, children: node.children.map(child => updateNode(child)) };
+            }
+            return node;
+        };
+        setRootPanel(prev => updateNode(prev));
     }, []);
 
     const countLeaves = (node: PanelNode): number => {
@@ -89,12 +119,55 @@ const SplittablePlotContainer: React.FC<Props> = ({ data }) => {
     const renderPanel = (node: PanelNode): React.ReactNode => {
         if (node.type === 'leaf') {
             const canClose = countLeaves(rootPanel) > 1;
+            const selectedSeries = node.selectedSeries || [];
+
+            const handleDragOver = (e: React.DragEvent) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+            };
+
+            const handleDrop = (e: React.DragEvent) => {
+                e.preventDefault();
+                const seriesKey = e.dataTransfer.getData('application/series-key');
+                if (seriesKey) {
+                    addSeriesToPanel(node.id, seriesKey);
+                }
+            };
+
             return (
-                <div key={node.id} className="flex flex-col h-full w-full bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden">
+                <div
+                    key={node.id}
+                    className="flex flex-col h-full w-full bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden"
+                    onDragOver={handleDragOver}
+                    onDrop={handleDrop}
+                >
                     {/* 工具栏 */}
                     <div className="flex items-center justify-between px-3 py-1.5 bg-slate-800/50 border-b border-slate-700/50">
-                        <span className="text-xs text-slate-400 font-mono">Plot</span>
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-2 flex-1 min-w-0 overflow-x-auto">
+                            {selectedSeries.length === 0 ? (
+                                <span className="text-xs text-slate-500 italic">空面板</span>
+                            ) : (
+                                selectedSeries.map(key => (
+                                    <div
+                                        key={key}
+                                        className="flex items-center gap-1 px-1.5 py-0.5 bg-slate-700/50 rounded text-xs group shrink-0"
+                                    >
+                                        <div
+                                            className="w-2 h-2 rounded-full"
+                                            style={{ backgroundColor: getSeriesColor(key) }}
+                                        />
+                                        <span className="text-slate-300 font-mono">{key}</span>
+                                        <button
+                                            onClick={() => removeSeriesFromPanel(node.id, key)}
+                                            className="text-slate-500 hover:text-red-400 transition-colors"
+                                        >
+                                            <X size={10} />
+                                        </button>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0 ml-2">
                             <button
                                 onClick={() => splitPanel(node.id, 'horizontal')}
                                 className="p-1 hover:bg-slate-700/50 rounded text-slate-400 hover:text-cyan-400 transition-colors"
@@ -115,14 +188,14 @@ const SplittablePlotContainer: React.FC<Props> = ({ data }) => {
                                     className="p-1 hover:bg-red-900/50 rounded text-slate-400 hover:text-red-400 transition-colors"
                                     title="关闭面板"
                                 >
-                                    <X size={14} />
+                                    <Trash2 size={14} />
                                 </button>
                             )}
                         </div>
                     </div>
                     {/* 图表区域 */}
                     <div className="flex-1 p-2 min-h-0">
-                        <TelemetryChart data={data} />
+                        <DynamicChart seriesKeys={selectedSeries} />
                     </div>
                 </div>
             );
