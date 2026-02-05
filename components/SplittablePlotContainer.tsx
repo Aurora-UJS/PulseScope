@@ -1,25 +1,14 @@
-import React, { useState, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { SplitSquareHorizontal, SplitSquareVertical, X, Trash2 } from 'lucide-react';
 import DynamicChart from './DynamicChart';
 import { getSeriesColor } from './DataSeriesList';
-
-interface PanelNode {
-    id: string;
-    type: 'leaf' | 'split';
-    direction?: 'horizontal' | 'vertical';
-    children?: PanelNode[];
-    ratio?: number;
-    selectedSeries?: string[];
-}
+import { useDataContext } from './DataContext';
+import { PanelNode } from '../type';
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 const SplittablePlotContainer: React.FC = () => {
-    const [rootPanel, setRootPanel] = useState<PanelNode>({
-        id: generateId(),
-        type: 'leaf',
-        selectedSeries: []
-    });
+    const { rootPanel, setRootPanel } = useDataContext();
 
     const splitPanel = useCallback((panelId: string, direction: 'horizontal' | 'vertical') => {
         const splitNode = (node: PanelNode): PanelNode => {
@@ -44,7 +33,7 @@ const SplittablePlotContainer: React.FC = () => {
             return node;
         };
         setRootPanel(prev => splitNode(prev));
-    }, []);
+    }, [setRootPanel]);
 
     const closePanel = useCallback((panelId: string) => {
         const removeNode = (node: PanelNode): PanelNode | null => {
@@ -73,7 +62,7 @@ const SplittablePlotContainer: React.FC = () => {
             const result = removeNode(prev);
             return result || { id: generateId(), type: 'leaf', selectedSeries: [] };
         });
-    }, []);
+    }, [setRootPanel]);
 
     const addSeriesToPanel = useCallback((panelId: string, seriesKey: string) => {
         const updateNode = (node: PanelNode): PanelNode => {
@@ -90,7 +79,7 @@ const SplittablePlotContainer: React.FC = () => {
             return node;
         };
         setRootPanel(prev => updateNode(prev));
-    }, []);
+    }, [setRootPanel]);
 
     const removeSeriesFromPanel = useCallback((panelId: string, seriesKey: string) => {
         const updateNode = (node: PanelNode): PanelNode => {
@@ -106,7 +95,7 @@ const SplittablePlotContainer: React.FC = () => {
             return node;
         };
         setRootPanel(prev => updateNode(prev));
-    }, []);
+    }, [setRootPanel]);
 
     const countLeaves = (node: PanelNode): number => {
         if (node.type === 'leaf') return 1;

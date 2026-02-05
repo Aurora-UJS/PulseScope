@@ -63,8 +63,20 @@ export interface WSDataMessage {
 
 export type WSMessage = WSMetadataMessage | WSDataMessage;
 
+// Panel Layout Types
+export interface PanelNode {
+  id: string;
+  type: 'leaf' | 'split';
+  direction?: 'horizontal' | 'vertical';
+  children?: PanelNode[];
+  ratio?: number;
+  selectedSeries?: string[];
+}
+
 export interface DataContextType {
   availableSeries: string[];
   timeSeriesData: Map<string, DataPoint[]>;
   isConnected: boolean;
+  rootPanel: PanelNode;
+  setRootPanel: React.Dispatch<React.SetStateAction<PanelNode>>;
 }

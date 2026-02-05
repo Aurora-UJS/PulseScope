@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { DataPoint, WSMessage, DataContextType } from '../type';
+import { DataPoint, WSMessage, DataContextType, PanelNode } from '../type';
 
 const MAX_DATA_POINTS = 200;
 
@@ -8,10 +8,20 @@ interface DataProviderProps {
     wsUrl?: string;
 }
 
+const generateId = () => Math.random().toString(36).substr(2, 9);
+
+const defaultRootPanel: PanelNode = {
+    id: generateId(),
+    type: 'leaf',
+    selectedSeries: []
+};
+
 const DataContext = createContext<DataContextType>({
     availableSeries: [],
     timeSeriesData: new Map(),
     isConnected: false,
+    rootPanel: defaultRootPanel,
+    setRootPanel: () => { },
 });
 
 export const useDataContext = () => useContext(DataContext);
@@ -23,6 +33,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     const [availableSeries, setAvailableSeries] = useState<string[]>([]);
     const [timeSeriesData, setTimeSeriesData] = useState<Map<string, DataPoint[]>>(new Map());
     const [isConnected, setIsConnected] = useState(false);
+    const [rootPanel, setRootPanel] = useState<PanelNode>(defaultRootPanel);
     const wsRef = useRef<WebSocket | null>(null);
 
     // 模拟数据生成（当没有后端连接时）
@@ -152,7 +163,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     }, [wsUrl, generateMockData]);
 
     return (
-        <DataContext.Provider value={{ availableSeries, timeSeriesData, isConnected }}>
+        <DataContext.Provider value={{ availableSeries, timeSeriesData, isConnected, rootPanel, setRootPanel }}>
             {children}
         </DataContext.Provider>
     );

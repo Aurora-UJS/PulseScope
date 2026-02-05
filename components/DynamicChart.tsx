@@ -65,13 +65,24 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
         );
     }
 
+    const formatTimestamp = (timestamp: number) => {
+        const date = new Date(timestamp);
+        return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}`;
+    };
+
     return (
         <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                 <XAxis
                     dataKey="timestamp"
-                    hide
+                    tickFormatter={formatTimestamp}
+                    stroke="#475569"
+                    fontSize={9}
+                    tickLine={false}
+                    axisLine={{ stroke: '#334155' }}
+                    interval="preserveStartEnd"
+                    minTickGap={60}
                 />
                 <YAxis
                     domain={['auto', 'auto']}
@@ -89,7 +100,7 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
                         fontSize: '10px'
                     }}
                     itemStyle={{ color: '#94a3b8' }}
-                    labelFormatter={() => ''}
+                    labelFormatter={(timestamp) => formatTimestamp(timestamp as number)}
                 />
                 <Legend
                     wrapperStyle={{ fontSize: '10px' }}
