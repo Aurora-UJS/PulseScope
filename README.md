@@ -1,5 +1,5 @@
 
-# Vision Monitor Pro 部署指南
+# PulseScope 部署指南
 
 > [!CAUTION]
 > ⚠️ **本项目仍在深度开发中，目前尚未进行完整测试，请谨慎使用！**
