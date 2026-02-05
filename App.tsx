@@ -1,11 +1,11 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  Activity, 
-  Terminal, 
-  Cpu, 
-  Video, 
-  Settings, 
+import {
+  Activity,
+  Terminal,
+  Cpu,
+  Video,
+  Settings,
   AlertCircle,
   Database,
   Link,
@@ -14,7 +14,7 @@ import {
   ChevronRight
 } from 'lucide-react';
 import VideoFeed from './components/VideoFeed';
-import TelemetryChart from './components/TelemetryChart';
+import SplittablePlotContainer from './components/SplittablePlotContainer';
 import Sidebar from './components/Sidebar';
 import ConsoleLog from './components/ConsoleLog';
 import StatusCard from './components/StatusCard';
@@ -42,7 +42,7 @@ const App: React.FC = () => {
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      
+
       // Update Telemetry
       const newPoint: TelemetryPoint = {
         timestamp: now,
@@ -59,7 +59,7 @@ const App: React.FC = () => {
         const x = i % 100;
         const y = Math.floor(i / 100);
         const d1 = Math.sqrt(Math.pow(x - 50, 2) + Math.pow(y - 50, 2));
-        const d2 = Math.sqrt(Math.pow(x - (50 + Math.sin(now/1000)*20), 2) + Math.pow(y - 40, 2));
+        const d2 = Math.sqrt(Math.pow(x - (50 + Math.sin(now / 1000) * 20), 2) + Math.pow(y - 40, 2));
         return Math.min(d1, d2) / 10;
       });
       setMapData(prev => ({ ...prev, grid: newGrid }));
@@ -95,9 +95,9 @@ const App: React.FC = () => {
             </div>
           </div>
           <div className="flex gap-4">
-             <button className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2">
-               <AlertCircle size={14} /> KILL_PROCESS
-             </button>
+            <button className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2">
+              <AlertCircle size={14} /> KILL_PROCESS
+            </button>
           </div>
         </header>
 
@@ -106,18 +106,18 @@ const App: React.FC = () => {
             <div className="h-full flex flex-col xl:flex-row gap-4">
               {/* 左侧主区域 */}
               <div className="flex-1 min-w-0 flex flex-col gap-4">
-                <div className="flex-1 min-h-[300px] bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden relative">
+                <div className="h-40 shrink-0 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden relative">
                   <VideoFeed />
                 </div>
-                <div className="h-48 shrink-0 bg-slate-900/40 border border-slate-800/50 rounded-lg p-4">
-                  <TelemetryChart data={telemetry} />
+                <div className="flex-1 min-h-[300px] bg-slate-900/40 border border-slate-800/50 rounded-lg p-2">
+                  <SplittablePlotContainer data={telemetry} />
                 </div>
               </div>
               {/* 右侧面板 */}
               <div className="w-full xl:w-80 shrink-0 flex flex-col gap-4">
                 <div className="grid grid-cols-2 gap-4">
                   <StatusCard label="NUC Load" value={`${status.nucCpuLoad.toFixed(1)}%`} subValue={`${status.nucTemp.toFixed(1)}°C`} icon={<Cpu size={18} className="text-orange-400" />} />
-                  <StatusCard label="Vision" value={`${telemetry[telemetry.length-1]?.fps || 0} FPS`} subValue="210 Avg" icon={<Video size={18} className="text-purple-400" />} />
+                  <StatusCard label="Vision" value={`${telemetry[telemetry.length - 1]?.fps || 0} FPS`} subValue="210 Avg" icon={<Video size={18} className="text-purple-400" />} />
                 </div>
                 <div className="flex-1 min-h-[300px] bg-slate-900/80 border border-slate-800/50 rounded-lg flex flex-col overflow-hidden">
                   <div className="px-4 py-2 border-b border-slate-800/50 text-xs font-bold text-slate-400 uppercase tracking-wider">Console Output</div>
@@ -129,9 +129,9 @@ const App: React.FC = () => {
 
           {activeTab === 'navigation' && (
             <div className="h-full flex flex-col gap-4">
-               <div className="flex-1 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden p-4">
-                 <MapView data={mapData} />
-               </div>
+              <div className="flex-1 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden p-4">
+                <MapView data={mapData} />
+              </div>
             </div>
           )}
 
