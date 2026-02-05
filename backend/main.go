@@ -13,21 +13,26 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ShmHeader 必须与 C++ 端的 shm_layout.hpp 严格对齐
 type ShmHeader struct {
-	MagicNumber  uint64
-	Version      uint64
-	TimestampMs  uint64
-	ImgOffset    uint64
-	ImgSize      uint64
-	Width        uint32
-	Height       uint32
-	JsonOffset   uint64
-	JsonSize     uint64
-	EsdfMap      [10000]float32
+	MagicNumber uint64
+	Version     uint64
+	TimestampMs uint64
+
+	ImgOffset uint64
+	ImgSize   uint64
+	Width     uint32
+	Height    uint32
+
+	JsonOffset uint64
+	JsonSize   uint64
+
+	EsdfMap [10000]float32
+
 	PidP         float32
 	PidI         float32
 	PidD         float32
-	Exposure     uint32
+	ExposureTime uint32
 	IsFireEnable bool
 }
 
@@ -71,7 +76,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		// 启动一个 goroutine 处理前端传来的参数
+		// 接收前端参数更新
 		go func() {
 			for {
 				_, message, err := conn.ReadMessage()
@@ -89,25 +94,51 @@ func main() {
 					if v, ok := update["pid_d"]; ok {
 						header.PidD = v
 					}
-					fmt.Printf("Updated PID from Web: P=%.2f\n", header.PidP)
+					fmt.Printf("Updated PID from Web: P=%.2f I=%.2f D=%.2f\n", header.PidP, header.PidI, header.PidD)
 				}
 			}
 		}()
 
-		// 主循环发送数据给前端
-		ticker := time.NewTicker(40 * time.Millisecond) // 25Hz 发送
+		// 主循环：读取 SHM 中的 JSON 数据并转发给前端
+		ticker := time.NewTicker(40 * time.Millisecond) // 25Hz
+		defer ticker.Stop()
+
 		for range ticker.C {
-			payload := map[string]interface{}{
-				"timestamp": header.TimestampMs,
-				"esdf":      header.EsdfMap,
-				"pid":       []float32{header.PidP, header.PidI, header.PidD},
+			// 读取算法写入的 JSON 数据
+			jsonOffset := header.JsonOffset
+			jsonSize := header.JsonSize
+
+			var series map[string]interface{}
+
+			if jsonSize > 0 && jsonSize < 10000 && jsonOffset > 0 {
+				// 从 SHM 读取 JSON 字符串
+				jsonBytes := data[jsonOffset : jsonOffset+jsonSize]
+				if err := json.Unmarshal(jsonBytes, &series); err != nil {
+					// JSON 解析失败，使用空 series
+					series = make(map[string]interface{})
+				}
+			} else {
+				series = make(map[string]interface{})
 			}
+
+			// 添加固定字段（PID 参数）作为可视化数据
+			series["pid_p"] = header.PidP
+			series["pid_i"] = header.PidI
+			series["pid_d"] = header.PidD
+
+			// 发送前端期望的格式
+			payload := map[string]interface{}{
+				"type":      "data",
+				"timestamp": header.TimestampMs,
+				"series":    series,
+			}
+
 			if err := conn.WriteJSON(payload); err != nil {
 				break
 			}
 		}
 	})
 
-	fmt.Println("Vision Pro Backend running on :5000")
+	fmt.Println("PulseScope Backend running on :5000")
 	log.Fatal(http.ListenAndServe(":5000", nil))
 }

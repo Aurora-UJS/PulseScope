@@ -39,3 +39,27 @@ npm run dev
 ## 3. 架构核心
 - **低耦合**: C++ 进程崩溃不会影响后端，后端重启会自动重新挂载 SHM。
 - **高性能**: 图像数据通过内存偏移量直接读取，无需经过序列化。
+
+
+## 4. C++ 接口
+
+``` cpp
+#include "vision_monitor.hpp"
+
+// 初始化 (只需一次)
+vision::Monitor::getInstance().init();
+
+// 每帧推送数据
+vision::Monitor::getInstance().pushData("ekf_x", ekf_state.x);
+vision::Monitor::getInstance().pushData("ekf_y", ekf_state.y);
+vision::Monitor::getInstance().pushData("fps", current_fps);
+
+// 或批量推送
+vision::Monitor::getInstance().pushData({
+    {"target_dist", 2.5},
+    {"gimbal_yaw", yaw_angle}
+});
+
+// 帧结束时提交
+vision::Monitor::getInstance().commit();
+```
