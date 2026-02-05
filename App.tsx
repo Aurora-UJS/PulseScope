@@ -11,7 +11,9 @@ import {
   Link,
   Navigation,
   SlidersHorizontal,
-  ChevronRight
+  ChevronRight,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import VideoFeed from './components/VideoFeed';
 import SplittablePlotContainer from './components/SplittablePlotContainer';
@@ -26,6 +28,7 @@ import { SystemStatus, LogEntry, LogLevel, ControlParams, MapData } from './type
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'navigation' | 'tuning'>('dashboard');
+  const [showVideoFeed, setShowVideoFeed] = useState(false); // 默认隐藏视频
   const [mapData, setMapData] = useState<MapData>({ grid: Array(10000).fill(0), width: 100, height: 100 });
   const [params, setParams] = useState<ControlParams>({
     pid_p: 1.2, pid_i: 0.05, pid_d: 0.1, exposure: 5000, fire_enabled: true
@@ -82,7 +85,19 @@ const App: React.FC = () => {
                 SHM_LINK_ACTIVE
               </div>
             </div>
-            <div className="flex gap-4">
+            <div className="flex gap-2">
+              {activeTab === 'dashboard' && (
+                <button
+                  onClick={() => setShowVideoFeed(!showVideoFeed)}
+                  className={`px-3 py-1 text-xs rounded border transition-all flex items-center gap-2 ${showVideoFeed
+                      ? 'bg-cyan-900/20 hover:bg-cyan-900/40 text-cyan-400 border-cyan-900/50'
+                      : 'bg-slate-800/50 hover:bg-slate-700/50 text-slate-400 border-slate-700/50'
+                    }`}
+                >
+                  {showVideoFeed ? <Eye size={14} /> : <EyeOff size={14} />}
+                  Video
+                </button>
+              )}
               <button className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2">
                 <AlertCircle size={14} /> KILL_PROCESS
               </button>
@@ -92,12 +107,16 @@ const App: React.FC = () => {
           <div className="flex-1 overflow-y-auto p-4 min-h-0">
             {activeTab === 'dashboard' && (
               <div className="h-full flex flex-col xl:flex-row gap-4">
-                {/* 左侧主区域 */}
-                <div className="flex-1 min-w-0 flex flex-col gap-4">
-                  <div className="h-40 shrink-0 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden relative">
-                    <VideoFeed />
-                  </div>
-                  <div className="flex-1 min-h-[300px] bg-slate-900/40 border border-slate-800/50 rounded-lg p-2">
+                {/* 主区域 */}
+                <div className="flex-1 min-w-0 flex flex-row gap-4">
+                  {/* 视频区域 - 可隐藏 */}
+                  {showVideoFeed && (
+                    <div className="shrink-0 w-64 h-64 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden relative">
+                      <VideoFeed />
+                    </div>
+                  )}
+                  {/* Plot 区域 */}
+                  <div className="flex-1 min-w-[300px] bg-slate-900/40 border border-slate-800/50 rounded-lg p-2">
                     <SplittablePlotContainer />
                   </div>
                 </div>
