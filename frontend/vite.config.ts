@@ -17,12 +17,10 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    rollupOptions: {
-      external: ['react', 'react-dom', 'lucide-react', 'recharts']
-    }
   },
+  // 预构建重依赖，让 Vite 在服务器启动时就打包完成，首次打开浏览器无需等待
   optimizeDeps: {
-    exclude: ['react', 'react-dom', 'lucide-react', 'recharts']
+    include: ['react', 'react-dom', 'recharts', 'lucide-react'],
   },
   resolve: {
     alias: {

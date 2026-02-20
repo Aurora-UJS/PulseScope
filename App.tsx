@@ -42,21 +42,24 @@ const App: React.FC = () => {
   });
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
-  // Simulation of ESDF Map Data
+  // FIX [无限重渲]: 移除 mapData.grid 依赖，改为空数组，仅挂载一次 interval。
+  // 使用 setMapData(prev => ...) 函数形式避免 stale closure，不需要将 grid 列入依赖。
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      const newGrid = mapData.grid.map((_, i) => {
-        const x = i % 100;
-        const y = Math.floor(i / 100);
-        const d1 = Math.sqrt(Math.pow(x - 50, 2) + Math.pow(y - 50, 2));
-        const d2 = Math.sqrt(Math.pow(x - (50 + Math.sin(now / 1000) * 20), 2) + Math.pow(y - 40, 2));
-        return Math.min(d1, d2) / 10;
+      setMapData(prev => {
+        const newGrid = prev.grid.map((_, i) => {
+          const x = i % 100;
+          const y = Math.floor(i / 100);
+          const d1 = Math.sqrt(Math.pow(x - 50, 2) + Math.pow(y - 50, 2));
+          const d2 = Math.sqrt(Math.pow(x - (50 + Math.sin(now / 1000) * 20), 2) + Math.pow(y - 40, 2));
+          return Math.min(d1, d2) / 10;
+        });
+        return { ...prev, grid: newGrid };
       });
-      setMapData(prev => ({ ...prev, grid: newGrid }));
     }, 100);
     return () => clearInterval(interval);
-  }, [mapData.grid]);
+  }, []); // 空依赖数组：interval 只注册一次，不随 grid 更新重建
 
   const addLog = useCallback((message: string, level: LogLevel = LogLevel.INFO) => {
     const newLog: LogEntry = {
@@ -90,8 +93,8 @@ const App: React.FC = () => {
                 <button
                   onClick={() => setShowVideoFeed(!showVideoFeed)}
                   className={`px-3 py-1 text-xs rounded border transition-all flex items-center gap-2 ${showVideoFeed
-                      ? 'bg-cyan-900/20 hover:bg-cyan-900/40 text-cyan-400 border-cyan-900/50'
-                      : 'bg-slate-800/50 hover:bg-slate-700/50 text-slate-400 border-slate-700/50'
+                    ? 'bg-cyan-900/20 hover:bg-cyan-900/40 text-cyan-400 border-cyan-900/50'
+                    : 'bg-slate-800/50 hover:bg-slate-700/50 text-slate-400 border-slate-700/50'
                     }`}
                 >
                   {showVideoFeed ? <Eye size={14} /> : <EyeOff size={14} />}

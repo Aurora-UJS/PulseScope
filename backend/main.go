@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -36,9 +38,27 @@ type ShmHeader struct {
 	IsFireEnable bool
 }
 
+const shmTotalSize = 10 * 1024 * 1024 // 10MB
+
+// clamp 将值钳制到 [min, max] 区间内，防止非法参数写入 SHM
+func clamp(v, min, max float32) float32 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// FIX [安全]: 限制 WebSocket 连接只允许来自本机前端，防止局域网恶意页面访问
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		return origin == "http://localhost:3000" ||
+			origin == "http://127.0.0.1:3000" ||
+			origin == "http://localhost:5173" ||
+			origin == "http://127.0.0.1:5173"
 	},
 }
 
@@ -61,8 +81,7 @@ func main() {
 	}
 	defer f.Close()
 
-	size := 10 * 1024 * 1024
-	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	data, err := syscall.Mmap(int(f.Fd()), 0, shmTotalSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -76,25 +95,39 @@ func main() {
 		}
 		defer conn.Close()
 
+		// FIX [goroutine泄漏]: 使用 context 管控读 goroutine 生命周期
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
 		// 接收前端参数更新
 		go func() {
+			defer cancel() // 读端断开时也触发取消
 			for {
-				_, message, err := conn.ReadMessage()
-				if err != nil {
-					break
-				}
-				var update map[string]float32
-				if err := json.Unmarshal(message, &update); err == nil {
-					if v, ok := update["pid_p"]; ok {
-						header.PidP = v
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_, message, err := conn.ReadMessage()
+					if err != nil {
+						return
 					}
-					if v, ok := update["pid_i"]; ok {
-						header.PidI = v
+					var update map[string]float32
+					if err := json.Unmarshal(message, &update); err == nil {
+						// FIX [安全]: 对写入 SHM 的参数进行范围校验，防止异常值导致硬件失控
+						if v, ok := update["pid_p"]; ok {
+							header.PidP = clamp(v, 0.0, 10.0)
+						}
+						if v, ok := update["pid_i"]; ok {
+							header.PidI = clamp(v, 0.0, 1.0)
+						}
+						if v, ok := update["pid_d"]; ok {
+							header.PidD = clamp(v, 0.0, 1.0)
+						}
+						if v, ok := update["exposure"]; ok {
+							header.ExposureTime = uint32(clamp(v, 100, 50000))
+						}
+						fmt.Printf("Updated PID from Web: P=%.2f I=%.2f D=%.2f\n", header.PidP, header.PidI, header.PidD)
 					}
-					if v, ok := update["pid_d"]; ok {
-						header.PidD = v
-					}
-					fmt.Printf("Updated PID from Web: P=%.2f I=%.2f D=%.2f\n", header.PidP, header.PidI, header.PidD)
 				}
 			}
 		}()
@@ -103,38 +136,53 @@ func main() {
 		ticker := time.NewTicker(40 * time.Millisecond) // 25Hz
 		defer ticker.Stop()
 
-		for range ticker.C {
-			// 读取算法写入的 JSON 数据
-			jsonOffset := header.JsonOffset
-			jsonSize := header.JsonSize
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// FIX [数据竞争]: 读两次并比较，检测 C++ 正在写入时的撕裂值
+				jsonOffset1 := header.JsonOffset
+				jsonSize1 := header.JsonSize
+				runtime.Gosched() // 让出 CPU，给 C++ 完成写入
+				jsonOffset2 := header.JsonOffset
+				jsonSize2 := header.JsonSize
+				if jsonOffset1 != jsonOffset2 || jsonSize1 != jsonSize2 {
+					continue // 跳过这帧，下帧再读
+				}
+				jsonOffset := jsonOffset1
+				jsonSize := jsonSize1
 
-			var series map[string]interface{}
+				var series map[string]interface{}
 
-			if jsonSize > 0 && jsonSize < 10000 && jsonOffset > 0 {
-				// 从 SHM 读取 JSON 字符串
-				jsonBytes := data[jsonOffset : jsonOffset+jsonSize]
-				if err := json.Unmarshal(jsonBytes, &series); err != nil {
-					// JSON 解析失败，使用空 series
+				// FIX [越界访问]: 同时验证 jsonOffset + jsonSize 不超出 SHM 映射总大小
+				if jsonSize > 0 && jsonSize < 65536 &&
+					jsonOffset > 0 &&
+					jsonOffset+jsonSize <= uint64(shmTotalSize) {
+					jsonBytes := data[jsonOffset : jsonOffset+jsonSize]
+					if err := json.Unmarshal(jsonBytes, &series); err != nil {
+						series = make(map[string]interface{})
+					}
+				} else {
 					series = make(map[string]interface{})
 				}
-			} else {
-				series = make(map[string]interface{})
-			}
 
-			// 添加固定字段（PID 参数）作为可视化数据
-			series["pid_p"] = header.PidP
-			series["pid_i"] = header.PidI
-			series["pid_d"] = header.PidD
+				// 添加固定字段（PID 参数）作为可视化数据
+				series["pid_p"] = header.PidP
+				series["pid_i"] = header.PidI
+				series["pid_d"] = header.PidD
 
-			// 发送前端期望的格式
-			payload := map[string]interface{}{
-				"type":      "data",
-				"timestamp": header.TimestampMs,
-				"series":    series,
-			}
+				payload := map[string]interface{}{
+					"type":      "data",
+					"timestamp": header.TimestampMs,
+					"series":    series,
+				}
 
-			if err := conn.WriteJSON(payload); err != nil {
-				break
+				// FIX [性能]: 设置写超时，防止慢客户端阻塞 ticker 节奏
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := conn.WriteJSON(payload); err != nil {
+					return
+				}
 			}
 		}
 	})
