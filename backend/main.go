@@ -213,7 +213,7 @@ func (s *ShmRuntime) ReadSeriesSnapshot() (uint64, map[string]float64, bool) {
 		return 0, nil, false
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		seq1 := s.header.Sequence
 		if seq1%2 == 1 {
 			runtime.Gosched()
@@ -229,6 +229,15 @@ func (s *ShmRuntime) ReadSeriesSnapshot() (uint64, map[string]float64, bool) {
 		exposure := s.header.ExposureTime
 		fireEnabled := s.header.IsFireEnable
 
+		var jsonCopy []byte
+		if jsonSize > 0 &&
+			jsonSize < 65536 &&
+			jsonOffset > 0 &&
+			jsonOffset+jsonSize <= uint64(len(s.data)) {
+			jsonCopy = make([]byte, int(jsonSize))
+			copy(jsonCopy, s.data[jsonOffset:jsonOffset+jsonSize])
+		}
+
 		seq2 := s.header.Sequence
 		if seq1 != seq2 || seq2%2 == 1 {
 			runtime.Gosched()
@@ -236,14 +245,8 @@ func (s *ShmRuntime) ReadSeriesSnapshot() (uint64, map[string]float64, bool) {
 		}
 
 		series := make(map[string]float64, 16)
-		if jsonSize > 0 &&
-			jsonSize < 65536 &&
-			jsonOffset > 0 &&
-			jsonOffset+jsonSize <= uint64(len(s.data)) {
-			jsonBytes := s.data[jsonOffset : jsonOffset+jsonSize]
-			for k, v := range parseSeriesJSON(jsonBytes) {
-				series[k] = v
-			}
+		for k, v := range parseSeriesJSON(jsonCopy) {
+			series[k] = v
 		}
 
 		series["pid_p"] = float64(pidP)
@@ -297,8 +300,18 @@ func clamp(v, min, max float32) float32 {
 	return v
 }
 
-func parseSeriesJSON(raw []byte) map[string]float64 {
-	out := make(map[string]float64)
+func parseSeriesJSON(raw []byte) (out map[string]float64) {
+	out = make(map[string]float64)
+	if len(raw) == 0 {
+		return out
+	}
+
+	defer func() {
+		if recover() != nil {
+			out = make(map[string]float64)
+		}
+	}()
+
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return out
