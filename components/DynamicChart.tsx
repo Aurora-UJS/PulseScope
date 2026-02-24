@@ -16,42 +16,37 @@ interface Props {
     seriesKeys: string[];
 }
 
+const MAX_RENDER_POINTS = 120;
+
 const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
     const { timeSeriesData } = useDataContext();
 
-    // 合并多个系列的数据到同一时间轴
+    // 合并多个系列到同一时间轴，避免逐点 nearest 搜索带来的 O(n^2) 开销。
     const chartData = useMemo(() => {
         if (seriesKeys.length === 0) return [];
 
-        // 收集所有时间戳
-        const allTimestamps = new Set<number>();
-        seriesKeys.forEach(key => {
+        const timeline = new Map<number, Record<string, number>>();
+        seriesKeys.forEach((key) => {
             const data = timeSeriesData.get(key);
-            if (data) {
-                data.forEach(point => allTimestamps.add(point.timestamp));
+            if (!data || data.length === 0) {
+                return;
             }
-        });
 
-        // 按时间戳排序
-        const sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b);
-
-        // 构建图表数据
-        return sortedTimestamps.map(timestamp => {
-            const point: Record<string, number> = { timestamp };
-            seriesKeys.forEach(key => {
-                const data = timeSeriesData.get(key);
-                if (data) {
-                    // 找到最接近的数据点
-                    const closest = data.reduce((prev, curr) =>
-                        Math.abs(curr.timestamp - timestamp) < Math.abs(prev.timestamp - timestamp) ? curr : prev
-                    );
-                    if (Math.abs(closest.timestamp - timestamp) < 200) { // 200ms 容差
-                        point[key] = closest.value;
-                    }
+            const tail = data.slice(-MAX_RENDER_POINTS);
+            tail.forEach((point) => {
+                const existing = timeline.get(point.timestamp);
+                if (existing) {
+                    existing[key] = point.value;
+                } else {
+                    timeline.set(point.timestamp, { timestamp: point.timestamp, [key]: point.value });
                 }
             });
-            return point;
-        }).slice(-100); // 只显示最近100个点
+        });
+
+        return Array
+            .from(timeline.values())
+            .sort((a, b) => a.timestamp - b.timestamp)
+            .slice(-MAX_RENDER_POINTS);
     }, [seriesKeys, timeSeriesData]);
 
     if (seriesKeys.length === 0) {

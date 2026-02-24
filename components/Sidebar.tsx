@@ -4,8 +4,6 @@ import {
   LayoutDashboard, 
   Navigation, 
   SlidersHorizontal, 
-  Terminal, 
-  HelpCircle,
   Database,
   Activity
 } from 'lucide-react';

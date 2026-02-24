@@ -61,7 +61,25 @@ export interface WSDataMessage {
   series: Record<string, number>;
 }
 
-export type WSMessage = WSMetadataMessage | WSDataMessage;
+export interface WSMapMessage {
+  type: 'map';
+  timestamp: number;
+  width: number;
+  height: number;
+  grid: number[];
+}
+
+export interface WSStatusMessage {
+  type: 'status';
+  timestamp: number;
+  backend_connected: boolean;
+  shm_active: boolean;
+  serial_port: string;
+  nuc_cpu_load: number;
+  nuc_temp: number;
+}
+
+export type WSMessage = WSMetadataMessage | WSDataMessage | WSMapMessage | WSStatusMessage;
 
 // Panel Layout Types
 export interface PanelNode {
@@ -76,7 +94,10 @@ export interface PanelNode {
 export interface DataContextType {
   availableSeries: string[];
   timeSeriesData: Map<string, DataPoint[]>;
+  mapData: MapData;
+  systemStatus: SystemStatus;
   isConnected: boolean;
+  sendControlUpdate: (payload: Partial<ControlParams>) => boolean;
   rootPanel: PanelNode;
   setRootPanel: React.Dispatch<React.SetStateAction<PanelNode>>;
 }
