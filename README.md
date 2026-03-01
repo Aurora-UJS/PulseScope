@@ -110,3 +110,5 @@ vision::Monitor::getInstance().syncParams(p, i, d, exposure, fire_enabled);
 
 - `GET /health`: 后端健康状态
 - `POST /api/control`: 控制参数写回（与 WS 写回字段一致）
+- `GET /api/video/latest`: 获取最新视频帧（PNG）
+- `POST /api/process/kill`: 终止目标进程（默认 `vision_producer`）

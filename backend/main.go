@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -23,6 +28,7 @@ import (
 const (
 	shmPath         = "/dev/shm/vision_debug_shm"
 	shmTotalSize    = 10 * 1024 * 1024 // 10MB
+	maxImageBytes   = 4 * 1024 * 1024
 	esdfCells       = 10000
 	esdfWidth       = 100
 	esdfHeight      = 100
@@ -101,6 +107,16 @@ type HealthResponse struct {
 	Status      string `json:"status"`
 	ShmAttached bool   `json:"shm_attached"`
 	Version     uint64 `json:"version"`
+}
+
+type KillProcessRequest struct {
+	Name string `json:"name"`
+}
+
+type KillProcessResponse struct {
+	Status      string `json:"status"`
+	ProcessName string `json:"process_name"`
+	KilledCount int    `json:"killed_count"`
 }
 
 type ShmRuntime struct {
@@ -289,6 +305,51 @@ func (s *ShmRuntime) ReadMapSnapshot() (uint64, []float32, bool) {
 	return 0, nil, false
 }
 
+func (s *ShmRuntime) ReadImageSnapshot() (uint64, int, int, []byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.header == nil || s.data == nil {
+		return 0, 0, 0, nil, false
+	}
+
+	for i := 0; i < 3; i++ {
+		seq1 := s.header.Sequence
+		if seq1%2 == 1 {
+			runtime.Gosched()
+			continue
+		}
+
+		ts := s.header.TimestampMs
+		imgOffset := s.header.ImgOffset
+		imgSize := s.header.ImgSize
+		width := int(s.header.Width)
+		height := int(s.header.Height)
+		if width <= 0 || height <= 0 || imgSize == 0 || imgSize > maxImageBytes {
+			return 0, 0, 0, nil, false
+		}
+
+		expectedSize := uint64(width) * uint64(height) * 4
+		if expectedSize == 0 || expectedSize > maxImageBytes || imgSize < expectedSize {
+			return 0, 0, 0, nil, false
+		}
+		if imgOffset == 0 || imgOffset+expectedSize > uint64(len(s.data)) {
+			return 0, 0, 0, nil, false
+		}
+
+		frame := make([]byte, int(expectedSize))
+		copy(frame, s.data[imgOffset:imgOffset+expectedSize])
+
+		seq2 := s.header.Sequence
+		if seq1 != seq2 || seq2%2 == 1 {
+			runtime.Gosched()
+			continue
+		}
+		return ts, width, height, frame, true
+	}
+
+	return 0, 0, 0, nil, false
+}
+
 // clamp 将值钳制到 [min, max] 区间内，防止非法参数写入 SHM
 func clamp(v, min, max float32) float32 {
 	if v < min {
@@ -330,6 +391,72 @@ func parseSeriesJSON(raw []byte) (out map[string]float64) {
 		}
 	}
 	return out
+}
+
+func encodeRGBAToPNG(width, height int, rgba []byte) ([]byte, error) {
+	if width <= 0 || height <= 0 {
+		return nil, errors.New("invalid frame dimensions")
+	}
+	expectedSize := width * height * 4
+	if expectedSize <= 0 || len(rgba) < expectedSize {
+		return nil, errors.New("invalid frame payload")
+	}
+
+	img := &image.RGBA{
+		Pix:    rgba[:expectedSize],
+		Stride: width * 4,
+		Rect:   image.Rect(0, 0, width, height),
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func killProcessesByName(name string) (int, error) {
+	if name == "" {
+		return 0, errors.New("empty process name")
+	}
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+
+	killed := 0
+	selfPID := os.Getpid()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == selfPID {
+			continue
+		}
+
+		exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil {
+			continue
+		}
+		if filepath.Base(exePath) != name {
+			continue
+		}
+
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.SIGTERM); err == nil {
+			killed++
+		}
+	}
+
+	if killed == 0 {
+		return 0, fmt.Errorf("no process named %q found", name)
+	}
+	return killed, nil
 }
 
 func writeJSON(conn *websocket.Conn, payload interface{}) error {
@@ -558,6 +685,63 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	http.HandleFunc("/api/video/latest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ts, width, height, rgba, ok := shm.ReadImageSnapshot()
+		if !ok {
+			http.Error(w, "no video frame available", http.StatusServiceUnavailable)
+			return
+		}
+
+		pngBytes, err := encodeRGBAToPNG(width, height, rgba)
+		if err != nil {
+			http.Error(w, "failed to encode frame", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("X-Frame-Timestamp", strconv.FormatUint(ts, 10))
+		w.Header().Set("X-Frame-Width", strconv.Itoa(width))
+		w.Header().Set("X-Frame-Height", strconv.Itoa(height))
+		_, _ = w.Write(pngBytes)
+	})
+
+	http.HandleFunc("/api/process/kill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		request := KillProcessRequest{Name: "vision_producer"}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid json payload", http.StatusBadRequest)
+			return
+		}
+		if request.Name == "" {
+			request.Name = "vision_producer"
+		}
+
+		killed, err := killProcessesByName(request.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(KillProcessResponse{
+			Status:      "ok",
+			ProcessName: request.Name,
+			KilledCount: killed,
+		})
 	})
 
 	fmt.Println("PulseScope Backend running on :5000")

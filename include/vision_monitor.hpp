@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace vision {
 
@@ -54,18 +55,22 @@ public:
 
         header = static_cast<ShmHeader*>(shm_ptr);
         
-        // 初始化默认参数，防止后端读到垃圾数据
-        if (header->magic_number != kShmMagicNumber || header->version != kShmVersion) {
-            std::memset(shm_ptr, 0, shm_size);
-            header->magic_number = kShmMagicNumber;
-            header->version = kShmVersion;
-            header->pid_p = 1.0f;
-            header->pid_i = 0.0f;
-            header->pid_d = 0.1f;
-            header->exposure_time = 5000;
-            header->is_fire_enabled = 1;
-            header->json_offset = sizeof(ShmHeader);
-        }
+	        // 初始化默认参数，防止后端读到垃圾数据
+	        if (header->magic_number != kShmMagicNumber || header->version != kShmVersion) {
+	            std::memset(shm_ptr, 0, shm_size);
+	            header->magic_number = kShmMagicNumber;
+	            header->version = kShmVersion;
+	            header->img_offset = 0;
+	            header->img_size = 0;
+	            header->width = 0;
+	            header->height = 0;
+	            header->pid_p = 1.0f;
+	            header->pid_i = 0.0f;
+	            header->pid_d = 0.1f;
+	            header->exposure_time = 5000;
+	            header->is_fire_enabled = 1;
+	            header->json_offset = sizeof(ShmHeader);
+	        }
 
         return true;
     }
@@ -123,23 +128,45 @@ public:
         json_buffer[key] = value ? 1.0 : 0.0;
     }
 
-    // 批量推送数据 (使用 initializer_list)
-    // 使用方法: Monitor::getInstance().pushData({{"ekf_x", 1.0}, {"ekf_y", 2.0}});
-    void pushData(std::initializer_list<std::pair<std::string, double>> items) {
-        for (const auto& item : items) {
-            json_buffer[item.first] = item.second;
-        }
-    }
+	    // 批量推送数据 (使用 initializer_list)
+	    // 使用方法: Monitor::getInstance().pushData({{"ekf_x", 1.0}, {"ekf_y", 2.0}});
+	    void pushData(std::initializer_list<std::pair<std::string, double>> items) {
+	        for (const auto& item : items) {
+	            json_buffer[item.first] = item.second;
+	        }
+	    }
 
-    // 提交数据到 SHM (应在每帧结束时调用一次)
-    void commit() {
-        if (!header) return;
-        const size_t json_offset = sizeof(ShmHeader);
-        if (shm_size <= json_offset) return;
-        
-        // 构建 JSON 字符串
-        std::string json_str;
-        json_str.reserve(json_buffer.size() * 28 + 4);
+	    // 推送 RGBA 图像帧。像素布局为 width*height*4。
+	    void pushImageRGBA(const uint8_t* rgba, uint32_t width, uint32_t height) {
+	        if (!rgba || width == 0 || height == 0) {
+	            image_buffer.clear();
+	            image_width = 0;
+	            image_height = 0;
+	            return;
+	        }
+
+	        const size_t frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+	        if (frame_size == 0) {
+	            image_buffer.clear();
+	            image_width = 0;
+	            image_height = 0;
+	            return;
+	        }
+
+	        image_buffer.assign(rgba, rgba + frame_size);
+	        image_width = width;
+	        image_height = height;
+	    }
+
+	    // 提交数据到 SHM (应在每帧结束时调用一次)
+	    void commit() {
+	        if (!header) return;
+	        const size_t header_size = sizeof(ShmHeader);
+	        if (shm_size <= header_size) return;
+	        
+	        // 构建 JSON 字符串
+	        std::string json_str;
+	        json_str.reserve(json_buffer.size() * 28 + 4);
         json_str.push_back('{');
         bool first = true;
         for (const auto& [key, value] : json_buffer) {
@@ -152,29 +179,51 @@ public:
         }
         json_str.push_back('}');
 
-        if (json_str.size() > kMaxJsonBytes) {
-            json_str.resize(kMaxJsonBytes);
-        }
+	        if (json_str.size() > kMaxJsonBytes) {
+	            json_str.resize(kMaxJsonBytes);
+	        }
+
+	        beginWrite();
+
+	        size_t cursor = header_size;
+	        const size_t expected_frame_size = static_cast<size_t>(image_width) * static_cast<size_t>(image_height) * 4;
+	        if (!image_buffer.empty() &&
+	            expected_frame_size == image_buffer.size() &&
+	            expected_frame_size > 0 &&
+	            cursor + expected_frame_size <= shm_size) {
+	            char* frame_region = static_cast<char*>(shm_ptr) + cursor;
+	            std::memcpy(frame_region, image_buffer.data(), expected_frame_size);
+	            header->img_offset = cursor;
+	            header->img_size = expected_frame_size;
+	            header->width = image_width;
+	            header->height = image_height;
+	            cursor += expected_frame_size;
+	        } else {
+	            header->img_offset = 0;
+	            header->img_size = 0;
+	            header->width = 0;
+	            header->height = 0;
+	        }
+
+	        size_t json_size = 0;
+	        if (cursor < shm_size) {
+	            const size_t max_writable = shm_size - cursor;
+	            json_size = std::min(json_str.size(), max_writable);
+	            if (json_size > 0) {
+	                char* json_region = static_cast<char*>(shm_ptr) + cursor;
+	                std::memcpy(json_region, json_str.c_str(), json_size);
+	            }
+	        }
+	        header->json_offset = cursor;
+	        header->json_size = json_size;
+	        header->timestamp_ms = nowMs();
+	        endWrite();
         
-        // 写入 SHM 的 JSON 区域 (紧跟在 header 后面)
-        const size_t max_writable = shm_size - json_offset;
-        size_t json_size = std::min(json_str.size(), max_writable);
-        
-        char* json_region = static_cast<char*>(shm_ptr) + json_offset;
-        beginWrite();
-        if (json_size > 0) {
-            std::memcpy(json_region, json_str.c_str(), json_size);
-        }
-        header->json_offset = json_offset;
-        header->json_size = json_size;
-        header->timestamp_ms = nowMs();
-        endWrite();
-        
-        json_buffer.clear();
-    }
+	        json_buffer.clear();
+	    }
 
 private:
-    Monitor() : shm_ptr(nullptr), header(nullptr), shm_size(0) {}
+	    Monitor() : shm_ptr(nullptr), header(nullptr), shm_size(0), image_width(0), image_height(0) {}
     Monitor(const Monitor&) = delete;
     Monitor& operator=(const Monitor&) = delete;
 
@@ -210,10 +259,13 @@ private:
         header->sequence += 1;
     }
 
-    void* shm_ptr;
-    ShmHeader* header;
-    size_t shm_size;
-    std::unordered_map<std::string, double> json_buffer;
+	    void* shm_ptr;
+	    ShmHeader* header;
+	    size_t shm_size;
+	    std::unordered_map<std::string, double> json_buffer;
+	    std::vector<uint8_t> image_buffer;
+	    uint32_t image_width;
+	    uint32_t image_height;
 };
 
 } // namespace vision

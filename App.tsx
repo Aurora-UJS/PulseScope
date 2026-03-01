@@ -22,6 +22,7 @@ const AppContent: React.FC = () => {
   const { mapData, systemStatus, isConnected, timeSeriesData } = useDataContext();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'navigation' | 'tuning'>('dashboard');
   const [showVideoFeed, setShowVideoFeed] = useState(false);
+  const [isKillingProcess, setIsKillingProcess] = useState(false);
   const [params, setParams] = useState<ControlParams>({
     pid_p: 1.2, pid_i: 0.05, pid_d: 0.1, exposure: 5000, fire_enabled: true
   });
@@ -45,6 +46,32 @@ const AppContent: React.FC = () => {
     if (!fpsData || fpsData.length === 0) return '--';
     return fpsData[fpsData.length - 1].value.toFixed(0);
   }, [timeSeriesData]);
+
+  const handleKillProcess = useCallback(async () => {
+    if (isKillingProcess) return;
+
+    setIsKillingProcess(true);
+    try {
+      const resp = await fetch('/api/process/kill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'vision_producer' })
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        addLog(`KILL_PROCESS failed: ${errText || resp.statusText}`, LogLevel.ERROR);
+        return;
+      }
+
+      const payload = await resp.json() as { killed_count?: number };
+      addLog(`KILL_PROCESS finished, terminated ${payload.killed_count ?? 0} process(es)`, LogLevel.WARN);
+    } catch (err) {
+      addLog(`KILL_PROCESS request error: ${err instanceof Error ? err.message : String(err)}`, LogLevel.ERROR);
+    } finally {
+      setIsKillingProcess(false);
+    }
+  }, [addLog, isKillingProcess]);
 
   return (
     <div className="flex h-screen w-screen bg-slate-950 font-sans selection:bg-cyan-500/30">
@@ -78,10 +105,11 @@ const AppContent: React.FC = () => {
               </button>
             )}
             <button
-              onClick={() => addLog('KILL_PROCESS 接口暂未接入后端', LogLevel.WARN)}
-              className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2"
+              onClick={handleKillProcess}
+              disabled={isKillingProcess}
+              className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2"
             >
-              <AlertCircle size={14} /> KILL_PROCESS
+              <AlertCircle size={14} /> {isKillingProcess ? 'KILLING...' : 'KILL_PROCESS'}
             </button>
           </div>
         </header>

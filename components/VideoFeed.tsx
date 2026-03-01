@@ -1,93 +1,43 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { useDataContext } from './DataContext';
 
-import React, { useEffect, useRef } from 'react';
+const REFRESH_INTERVAL_MS = 120;
 
 const VideoFeed: React.FC = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const { isConnected } = useDataContext();
+  const [nonce, setNonce] = useState<number>(() => Date.now());
+  const [frameReady, setFrameReady] = useState(false);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    if (!canvas || !container) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!isConnected) {
+      setFrameReady(false);
+      return;
+    }
 
-    // 自适应容器大小
-    const resizeCanvas = () => {
-      const rect = container.getBoundingClientRect();
-      canvas.width = rect.width;
-      canvas.height = rect.height;
-    };
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
+    const timer = window.setInterval(() => {
+      setNonce(Date.now());
+    }, REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [isConnected]);
 
-    let animationFrameId: number;
-    let frameCount = 0;
-
-    const render = () => {
-      frameCount++;
-      const w = canvas.width;
-      const h = canvas.height;
-
-      // Draw background noise/gradient to simulate camera noise
-      ctx.fillStyle = '#0f172a';
-      ctx.fillRect(0, 0, w, h);
-      
-      // Simulate "Real-time" camera artifacts
-      for (let i = 0; i < 50; i++) {
-        ctx.fillStyle = `rgba(255, 255, 255, ${Math.random() * 0.05})`;
-        ctx.fillRect(Math.random() * w, Math.random() * h, 1, 1);
-      }
-
-      // Draw Aiming Crosshair / Detection Box
-      const centerX = w / 2 + Math.sin(frameCount / 20) * 100;
-      const centerY = h / 2 + Math.cos(frameCount / 30) * 50;
-      
-      // Detection Box
-      ctx.strokeStyle = '#22d3ee'; // cyan-400
-      ctx.lineWidth = 2;
-      ctx.strokeRect(centerX - 40, centerY - 25, 80, 50);
-      
-      // ID Label
-      ctx.fillStyle = '#22d3ee';
-      ctx.font = '10px monospace';
-      ctx.fillText(`TARGET_ID: 1_ARMOR`, centerX - 40, centerY - 30);
-      ctx.fillText(`CONF: 0.98`, centerX + 5, centerY - 30);
-
-      // Scanning lines
-      ctx.strokeStyle = 'rgba(34, 211, 238, 0.1)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(0, centerY);
-      ctx.lineTo(w, centerY);
-      ctx.stroke();
-
-      // UI Overlay Grid
-      ctx.strokeStyle = 'rgba(51, 65, 85, 0.3)';
-      ctx.lineWidth = 0.5;
-      for(let i = 0; i < w; i += 50) {
-        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
-      }
-      for(let j = 0; j < h; j += 50) {
-        ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke();
-      }
-
-      animationFrameId = requestAnimationFrame(render);
-    };
-
-    render();
-    return () => {
-      cancelAnimationFrame(animationFrameId);
-      window.removeEventListener('resize', resizeCanvas);
-    };
-  }, []);
+  const frameSrc = useMemo(() => `/api/video/latest?ts=${nonce}`, [nonce]);
 
   return (
-    <div ref={containerRef} className="w-full h-full">
-      <canvas 
-        ref={canvasRef} 
-        className="w-full h-full"
-      />
+    <div className="relative w-full h-full bg-slate-950">
+      {isConnected && (
+        <img
+          src={frameSrc}
+          alt="Live Vision Frame"
+          className="w-full h-full object-cover"
+          onLoad={() => setFrameReady(true)}
+          onError={() => setFrameReady(false)}
+          draggable={false}
+        />
+      )}
+
+      <div className="absolute left-2 top-2 px-2 py-1 rounded bg-slate-900/80 border border-slate-700/60 text-[10px] font-mono text-cyan-300">
+        {isConnected ? (frameReady ? 'LIVE_VIDEO' : 'WAITING_FRAME') : 'BACKEND_OFFLINE'}
+      </div>
     </div>
   );
 };

@@ -2,6 +2,7 @@
 #include "../include/vision_monitor.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -39,8 +40,11 @@ int main() {
     const int map_hz = readEnvInt("PULSESCOPE_MAP_HZ", 10, 1, 120);
     const int stress_series = readEnvInt("PULSESCOPE_STRESS_SERIES", 24, 0, 512);
     const int noise_level = readEnvInt("PULSESCOPE_NOISE_LEVEL", 10, 0, 100);
+    const int video_width = 320;
+    const int video_height = 240;
 
     std::vector<float> esdf_map(vision::kEsdfCells, 0.0f);
+    std::vector<uint8_t> video_rgba(video_width * video_height * 4, 0);
     std::vector<std::string> stress_keys;
     stress_keys.reserve(stress_series);
     for (int i = 0; i < stress_series; ++i) {
@@ -126,6 +130,52 @@ int main() {
             monitor.pushData(stress_keys[idx], signal);
         }
 
+        // 4. 生成并写入视频帧（RGBA）
+        const int target_x = static_cast<int>((0.5f + 0.35f * std::sin(t * 0.9f)) * static_cast<float>(video_width));
+        const int target_y = static_cast<int>((0.5f + 0.30f * std::cos(t * 1.1f)) * static_cast<float>(video_height));
+        const int half_box_w = 28;
+        const int half_box_h = 18;
+
+        for (int y = 0; y < video_height; ++y) {
+            for (int x = 0; x < video_width; ++x) {
+                const size_t offset = (static_cast<size_t>(y) * video_width + static_cast<size_t>(x)) * 4;
+                const float nx = static_cast<float>(x) / static_cast<float>(video_width);
+                const float ny = static_cast<float>(y) / static_cast<float>(video_height);
+
+                const uint8_t r = static_cast<uint8_t>(16 + 26 * ny + 8 * std::sin(t * 0.8f));
+                const uint8_t g = static_cast<uint8_t>(28 + 80 * nx);
+                const uint8_t b = static_cast<uint8_t>(42 + 48 * (0.5f + 0.5f * std::sin(t * 1.4f + nx * 6.0f)));
+
+                video_rgba[offset + 0] = r;
+                video_rgba[offset + 1] = g;
+                video_rgba[offset + 2] = b;
+                video_rgba[offset + 3] = 255;
+            }
+        }
+
+        auto drawPixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+            if (x < 0 || x >= video_width || y < 0 || y >= video_height) return;
+            const size_t offset = (static_cast<size_t>(y) * video_width + static_cast<size_t>(x)) * 4;
+            video_rgba[offset + 0] = r;
+            video_rgba[offset + 1] = g;
+            video_rgba[offset + 2] = b;
+            video_rgba[offset + 3] = 255;
+        };
+
+        for (int x = target_x - half_box_w; x <= target_x + half_box_w; ++x) {
+            drawPixel(x, target_y - half_box_h, 34, 211, 238);
+            drawPixel(x, target_y + half_box_h, 34, 211, 238);
+        }
+        for (int y = target_y - half_box_h; y <= target_y + half_box_h; ++y) {
+            drawPixel(target_x - half_box_w, y, 34, 211, 238);
+            drawPixel(target_x + half_box_w, y, 34, 211, 238);
+        }
+        for (int dxy = -10; dxy <= 10; ++dxy) {
+            drawPixel(target_x + dxy, target_y, 255, 255, 255);
+            drawPixel(target_x, target_y + dxy, 255, 255, 255);
+        }
+
+        monitor.pushImageRGBA(video_rgba.data(), static_cast<uint32_t>(video_width), static_cast<uint32_t>(video_height));
         monitor.commit();
         frame_id++;
 

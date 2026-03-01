@@ -58,7 +58,7 @@ const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
                     </span>
                     <div className={`flex items-center gap-1.5 text-xs ${isConnected ? 'text-green-400' : 'text-amber-400'}`}>
                         <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-green-400' : 'bg-amber-400'} animate-pulse`} />
-                        {isConnected ? 'LIVE' : 'MOCK'}
+                        {isConnected ? 'LIVE' : 'OFFLINE'}
                     </div>
                 </div>
                 {/* Search */}
