@@ -19,7 +19,7 @@ import ParamPanel from './components/ParamPanel';
 import { LogEntry, LogLevel, ControlParams } from './type';
 
 const AppContent: React.FC = () => {
-  const { mapData, systemStatus, isConnected, timeSeriesData } = useDataContext();
+  const { mapData, systemStatus, isConnected, videoFps } = useDataContext();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'navigation' | 'tuning'>('dashboard');
   const [showVideoFeed, setShowVideoFeed] = useState(false);
   const [isKillingProcess, setIsKillingProcess] = useState(false);
@@ -41,11 +41,6 @@ const AppContent: React.FC = () => {
     backendConnected: isConnected && systemStatus.backendConnected
   }), [isConnected, systemStatus]);
 
-  const latestFps = useMemo(() => {
-    const fpsData = timeSeriesData.get('fps');
-    if (!fpsData || fpsData.length === 0) return '--';
-    return fpsData[fpsData.length - 1].value.toFixed(0);
-  }, [timeSeriesData]);
 
   const handleKillProcess = useCallback(async () => {
     if (isKillingProcess) return;
@@ -130,7 +125,7 @@ const AppContent: React.FC = () => {
               <div className="w-full xl:w-64 shrink-0 flex flex-col gap-4">
                 <div className="grid grid-cols-2 gap-2">
                   <StatusCard label="NUC" value={`${mergedStatus.nucCpuLoad.toFixed(0)}%`} subValue={`${mergedStatus.nucTemp.toFixed(0)}°C`} icon={<Cpu size={16} className="text-orange-400" />} />
-                  <StatusCard label="Vision" value={latestFps} subValue="FPS" icon={<Video size={16} className="text-purple-400" />} />
+                  <StatusCard label="Vision" value={videoFps} subValue="FPS" icon={<Video size={16} className="text-purple-400" />} />
                 </div>
                 <div className="flex-1 min-h-[200px] border border-slate-800/50 rounded-lg overflow-hidden">
                   <DataSeriesList />

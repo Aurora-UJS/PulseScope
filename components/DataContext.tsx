@@ -79,6 +79,7 @@ const DataContext = createContext<DataContextType>({
     rootPanel: { id: '', type: 'leaf', selectedSeries: [] },
     setRootPanel: () => { },
     videoFrameUrl: null,
+    videoFps: 0,
     activePanelId: null,
     setActivePanelId: () => { },
     addSeriesToActivePanel: () => { },
@@ -97,6 +98,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     const [isConnected, setIsConnected] = useState(false);
     const [rootPanel, setRootPanel] = useState<PanelNode>(loadSavedLayout);
     const [videoFrameUrl, setVideoFrameUrl] = useState<string | null>(null);
+    const [videoFps, setVideoFps] = useState(0);
     const [activePanelId, setActivePanelIdState] = useState<string | null>(() => findFirstLeafId(loadSavedLayout()));
 
     // 面板布局持久化到 localStorage
@@ -124,6 +126,10 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     const isDisposedRef = useRef(false);
     const knownSeriesRef = useRef<Set<string>>(new Set());
     const prevVideoUrlRef = useRef<string | null>(null);
+
+    // 视频帧率计数
+    const videoFrameCountRef = useRef(0);
+    const videoFpsTimerRef = useRef<number>(0);
 
     // rAF 批量更新缓冲
     const pendingDataRef = useRef<{ timestamp: number; series: Record<string, number> }[]>([]);
@@ -186,6 +192,8 @@ export const DataProvider: React.FC<DataProviderProps> = ({
         const magic = view.getUint32(0, true);
         if (magic !== VIDEO_FRAME_MAGIC) return;
 
+        videoFrameCountRef.current++;
+
         const jpegData = buffer.slice(16);
         const blob = new Blob([jpegData], { type: 'image/jpeg' });
         const url = URL.createObjectURL(blob);
@@ -214,6 +222,13 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     useEffect(() => {
         isDisposedRef.current = false;
         const resolvedWsUrl = wsUrl || getDefaultWsUrl();
+
+        // 每秒统计实际接收视频帧率
+        videoFrameCountRef.current = 0;
+        videoFpsTimerRef.current = window.setInterval(() => {
+            setVideoFps(videoFrameCountRef.current);
+            videoFrameCountRef.current = 0;
+        }, 1000);
 
         const scheduleReconnect = (connectFn: () => void) => {
             if (isDisposedRef.current) return;
@@ -325,6 +340,10 @@ export const DataProvider: React.FC<DataProviderProps> = ({
 
         return () => {
             isDisposedRef.current = true;
+            if (videoFpsTimerRef.current) {
+                window.clearInterval(videoFpsTimerRef.current);
+                videoFpsTimerRef.current = 0;
+            }
             if (reconnectTimerRef.current !== null) {
                 window.clearTimeout(reconnectTimerRef.current);
                 reconnectTimerRef.current = null;
@@ -356,6 +375,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                 rootPanel,
                 setRootPanel,
                 videoFrameUrl,
+                videoFps,
                 activePanelId,
                 setActivePanelId,
                 addSeriesToActivePanel,

@@ -107,6 +107,7 @@ export interface DataContextType {
   rootPanel: PanelNode;
   setRootPanel: React.Dispatch<React.SetStateAction<PanelNode>>;
   videoFrameUrl: string | null;
+  videoFps: number;
   activePanelId: string | null;
   setActivePanelId: (id: string) => void;
   addSeriesToActivePanel: (seriesKey: string) => void;
