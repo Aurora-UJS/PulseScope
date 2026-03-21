@@ -82,6 +82,8 @@ export interface WSStatusMessage {
 export type WSMessage = WSMetadataMessage | WSDataMessage | WSMapMessage | WSStatusMessage;
 
 // Panel Layout Types
+export type AxisMode = 'auto' | 'lock' | 'manual';
+
 export interface PanelNode {
   id: string;
   type: 'leaf' | 'split';
@@ -89,6 +91,10 @@ export interface PanelNode {
   children?: PanelNode[];
   ratio?: number;
   selectedSeries?: string[];
+  axisMode?: AxisMode;
+  lockedDomain?: [number, number] | null;
+  manualMin?: string;
+  manualMax?: string;
 }
 
 export interface DataContextType {

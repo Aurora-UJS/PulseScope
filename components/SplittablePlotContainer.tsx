@@ -135,6 +135,24 @@ const SplittablePlotContainer: React.FC = () => {
         setRootPanel(prev => updateNode(prev));
     }, [setRootPanel]);
 
+    const onAxisSettingsChange = useCallback((panelId: string, patch: {
+        axisMode?: import('../type').AxisMode;
+        lockedDomain?: [number, number] | null;
+        manualMin?: string;
+        manualMax?: string;
+    }) => {
+        const updateNode = (node: PanelNode): PanelNode => {
+            if (node.id === panelId && node.type === 'leaf') {
+                return { ...node, ...patch };
+            }
+            if (node.type === 'split' && node.children) {
+                return { ...node, children: node.children.map(c => updateNode(c)) };
+            }
+            return node;
+        };
+        setRootPanel(prev => updateNode(prev));
+    }, [setRootPanel]);
+
     const countLeaves = (node: PanelNode): number => {
         if (node.type === 'leaf') return 1;
         if (node.children) {
@@ -156,6 +174,7 @@ const SplittablePlotContainer: React.FC = () => {
                 onAddSeries={addSeriesToPanel}
                 onRemoveSeries={removeSeriesFromPanel}
                 onMoveSeries={moveSeriesBetweenPanels}
+                onAxisSettingsChange={onAxisSettingsChange}
             />;
         }
 
@@ -274,11 +293,17 @@ interface LeafPanelProps {
     onAddSeries: (panelId: string, seriesKey: string) => void;
     onRemoveSeries: (panelId: string, seriesKey: string) => void;
     onMoveSeries: (sourcePanelId: string, targetPanelId: string, seriesKey: string) => void;
+    onAxisSettingsChange: (panelId: string, patch: {
+        axisMode?: import('../type').AxisMode;
+        lockedDomain?: [number, number] | null;
+        manualMin?: string;
+        manualMax?: string;
+    }) => void;
 }
 
 const LeafPanel: React.FC<LeafPanelProps> = ({
     node, isActive, canClose,
-    onActivate, onSplit, onClose, onAddSeries, onRemoveSeries, onMoveSeries
+    onActivate, onSplit, onClose, onAddSeries, onRemoveSeries, onMoveSeries, onAxisSettingsChange
 }) => {
     const [dragOver, setDragOver] = useState(false);
     const dragCounterRef = useRef(0);
@@ -409,7 +434,15 @@ const LeafPanel: React.FC<LeafPanelProps> = ({
             </div>
             {/* 图表区域 */}
             <div className="flex-1 p-2 min-h-0">
-                <DynamicChart seriesKeys={selectedSeries} />
+                <DynamicChart
+                    seriesKeys={selectedSeries}
+                    panelId={node.id}
+                    axisMode={node.axisMode || 'auto'}
+                    lockedDomain={node.lockedDomain ?? null}
+                    manualMin={node.manualMin ?? '-10'}
+                    manualMax={node.manualMax ?? '10'}
+                    onAxisSettingsChange={onAxisSettingsChange}
+                />
             </div>
         </div>
     );

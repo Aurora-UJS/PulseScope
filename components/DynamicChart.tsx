@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo } from 'react';
 import {
     LineChart,
     Line,
@@ -11,25 +11,34 @@ import {
 } from 'recharts';
 import { useDataContext } from './DataContext';
 import { getSeriesColor } from './DataSeriesList';
+import { AxisMode } from '../type';
 
 interface Props {
     seriesKeys: string[];
+    panelId: string;
+    axisMode: AxisMode;
+    lockedDomain: [number, number] | null;
+    manualMin: string;
+    manualMax: string;
+    onAxisSettingsChange: (panelId: string, patch: {
+        axisMode?: AxisMode;
+        lockedDomain?: [number, number] | null;
+        manualMin?: string;
+        manualMax?: string;
+    }) => void;
 }
 
 const MAX_RENDER_POINTS = 120;
-const DEFAULT_MANUAL_MIN = -10;
-const DEFAULT_MANUAL_MAX = 10;
+const DEFAULT_MANUAL_MIN = '-10';
+const DEFAULT_MANUAL_MAX = '10';
 const AUTO_DOMAIN: ['auto', 'auto'] = ['auto', 'auto'];
 
-type AxisMode = 'auto' | 'lock' | 'manual';
 type NumericDomain = [number, number];
 
-const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
+const DynamicChart: React.FC<Props> = ({
+    seriesKeys, panelId, axisMode, lockedDomain, manualMin: manualMinInput, manualMax: manualMaxInput, onAxisSettingsChange
+}) => {
     const { timeSeriesData } = useDataContext();
-    const [axisMode, setAxisMode] = useState<AxisMode>('auto');
-    const [lockedDomain, setLockedDomain] = useState<NumericDomain | null>(null);
-    const [manualMinInput, setManualMinInput] = useState<string>(String(DEFAULT_MANUAL_MIN));
-    const [manualMaxInput, setManualMaxInput] = useState<string>(String(DEFAULT_MANUAL_MAX));
 
     // 合并多个系列到同一时间轴，避免逐点 nearest 搜索带来的 O(n^2) 开销。
     const chartData = useMemo(() => {
@@ -92,16 +101,16 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
 
     useEffect(() => {
         if (axisMode === 'lock' && !lockedDomain && dataDomain) {
-            setLockedDomain(dataDomain);
+            onAxisSettingsChange(panelId, { lockedDomain: dataDomain });
         }
-    }, [axisMode, dataDomain, lockedDomain]);
+    }, [axisMode, dataDomain, lockedDomain, onAxisSettingsChange, panelId]);
 
     const manualMin = Number(manualMinInput);
     const manualMax = Number(manualMaxInput);
     const isManualDomainValid = Number.isFinite(manualMin) && Number.isFinite(manualMax) && manualMin < manualMax;
     const manualDomain: NumericDomain = isManualDomainValid
         ? [manualMin, manualMax]
-        : [DEFAULT_MANUAL_MIN, DEFAULT_MANUAL_MAX];
+        : [Number(DEFAULT_MANUAL_MIN), Number(DEFAULT_MANUAL_MAX)];
 
     const yDomain = useMemo<NumericDomain | ['auto', 'auto']>(() => {
         if (axisMode === 'auto') {
@@ -120,28 +129,29 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
     }, [axisMode, dataDomain, isManualDomainValid, lockedDomain, manualDomain]);
 
     const applyAxisMode = useCallback((mode: AxisMode) => {
-        setAxisMode(mode);
+        const patch: Parameters<typeof onAxisSettingsChange>[1] = { axisMode: mode };
         if (mode === 'lock') {
-            setLockedDomain((prev) => prev || dataDomain);
+            patch.lockedDomain = lockedDomain || dataDomain;
         }
         if (mode === 'auto') {
-            setLockedDomain(null);
+            patch.lockedDomain = null;
         }
-    }, [dataDomain]);
+        onAxisSettingsChange(panelId, patch);
+    }, [dataDomain, lockedDomain, onAxisSettingsChange, panelId]);
 
     const lockCurrentDomain = useCallback(() => {
         if (dataDomain) {
-            setLockedDomain(dataDomain);
+            onAxisSettingsChange(panelId, { lockedDomain: dataDomain });
         }
-    }, [dataDomain]);
+    }, [dataDomain, onAxisSettingsChange, panelId]);
 
     const fillManualFromData = useCallback(() => {
-        if (!dataDomain) {
-            return;
-        }
-        setManualMinInput(dataDomain[0].toFixed(3));
-        setManualMaxInput(dataDomain[1].toFixed(3));
-    }, [dataDomain]);
+        if (!dataDomain) return;
+        onAxisSettingsChange(panelId, {
+            manualMin: dataDomain[0].toFixed(3),
+            manualMax: dataDomain[1].toFixed(3),
+        });
+    }, [dataDomain, onAxisSettingsChange, panelId]);
 
     if (seriesKeys.length === 0) {
         return (
@@ -187,7 +197,7 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
                     <input
                         type="number"
                         value={manualMinInput}
-                        onChange={(e) => setManualMinInput(e.target.value)}
+                        onChange={(e) => onAxisSettingsChange(panelId, { manualMin: e.target.value })}
                         className="w-16 bg-slate-800/80 text-slate-200 text-[10px] border border-slate-700 rounded px-1 py-0.5 focus:outline-none"
                         aria-label="manual y min"
                     />
@@ -195,7 +205,7 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
                     <input
                         type="number"
                         value={manualMaxInput}
-                        onChange={(e) => setManualMaxInput(e.target.value)}
+                        onChange={(e) => onAxisSettingsChange(panelId, { manualMax: e.target.value })}
                         className="w-16 bg-slate-800/80 text-slate-200 text-[10px] border border-slate-700 rounded px-1 py-0.5 focus:outline-none"
                         aria-label="manual y max"
                     />
@@ -266,9 +276,14 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
 };
 
 export default React.memo(DynamicChart, (prev, next) => {
+    if (prev.panelId !== next.panelId) return false;
+    if (prev.axisMode !== next.axisMode) return false;
+    if (prev.manualMin !== next.manualMin) return false;
+    if (prev.manualMax !== next.manualMax) return false;
+    if (prev.lockedDomain !== next.lockedDomain) return false;
     if (prev.seriesKeys.length !== next.seriesKeys.length) return false;
     for (let i = 0; i < prev.seriesKeys.length; i++) {
         if (prev.seriesKeys[i] !== next.seriesKeys[i]) return false;
     }
-    return true; // seriesKeys 相同 → 跳过因父组件面板树变化导致的重渲染
+    return true;
 });
