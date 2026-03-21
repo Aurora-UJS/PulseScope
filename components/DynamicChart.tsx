@@ -265,4 +265,10 @@ const DynamicChart: React.FC<Props> = ({ seriesKeys }) => {
     );
 };
 
-export default DynamicChart;
+export default React.memo(DynamicChart, (prev, next) => {
+    if (prev.seriesKeys.length !== next.seriesKeys.length) return false;
+    for (let i = 0; i < prev.seriesKeys.length; i++) {
+        if (prev.seriesKeys[i] !== next.seriesKeys[i]) return false;
+    }
+    return true; // seriesKeys 相同 → 跳过因父组件面板树变化导致的重渲染
+});

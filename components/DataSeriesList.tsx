@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, memo } from 'react';
 import { Search, GripVertical, TrendingUp } from 'lucide-react';
 import { useDataContext } from './DataContext';
+import { DataPoint } from '../type';
 
 interface Props {
     className?: string;
@@ -28,6 +29,42 @@ const getSeriesColor = (key: string): string => {
     return `hsl(${hue}, 70%, 60%)`;
 };
 
+interface SeriesItemProps {
+    seriesKey: string;
+    data: DataPoint[] | undefined;
+}
+
+const SeriesItem = memo<SeriesItemProps>(({ seriesKey, data }) => {
+    const latestValue = data && data.length > 0 ? data[data.length - 1].value.toFixed(2) : '--';
+    const color = getSeriesColor(seriesKey);
+
+    const handleDragStart = (e: React.DragEvent) => {
+        e.dataTransfer.setData('application/series-key', seriesKey);
+        e.dataTransfer.effectAllowed = 'copy';
+    };
+
+    return (
+        <div
+            draggable
+            onDragStart={handleDragStart}
+            className="flex items-center gap-2 px-2 py-1.5 bg-slate-800/30 hover:bg-slate-700/50 rounded cursor-grab active:cursor-grabbing transition-colors group"
+        >
+            <GripVertical size={12} className="text-slate-600 group-hover:text-slate-400" />
+            <div
+                className="w-2 h-2 rounded-full shrink-0"
+                style={{ backgroundColor: color }}
+            />
+            <span className="flex-1 text-xs text-slate-300 font-mono truncate">
+                {seriesKey}
+            </span>
+            <span className="text-xs text-slate-500 font-mono tabular-nums">
+                {latestValue}
+            </span>
+            <TrendingUp size={10} className="text-slate-600" />
+        </div>
+    );
+});
+
 const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
     const { availableSeries, timeSeriesData, isConnected } = useDataContext();
     const [searchQuery, setSearchQuery] = useState('');
@@ -35,18 +72,6 @@ const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
     const filteredSeries = availableSeries.filter(key =>
         key.toLowerCase().includes(searchQuery.toLowerCase())
     );
-
-    const handleDragStart = (e: React.DragEvent, seriesKey: string) => {
-        e.dataTransfer.setData('application/series-key', seriesKey);
-        e.dataTransfer.effectAllowed = 'copy';
-    };
-
-    const getLatestValue = (key: string): string => {
-        const data = timeSeriesData.get(key);
-        if (!data || data.length === 0) return '--';
-        const latest = data[data.length - 1].value;
-        return latest.toFixed(2);
-    };
 
     return (
         <div className={`flex flex-col h-full bg-slate-900/80 ${className}`}>
@@ -82,25 +107,11 @@ const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
                     </div>
                 ) : (
                     filteredSeries.map(key => (
-                        <div
+                        <SeriesItem
                             key={key}
-                            draggable
-                            onDragStart={(e) => handleDragStart(e, key)}
-                            className="flex items-center gap-2 px-2 py-1.5 bg-slate-800/30 hover:bg-slate-700/50 rounded cursor-grab active:cursor-grabbing transition-colors group"
-                        >
-                            <GripVertical size={12} className="text-slate-600 group-hover:text-slate-400" />
-                            <div
-                                className="w-2 h-2 rounded-full shrink-0"
-                                style={{ backgroundColor: getSeriesColor(key) }}
-                            />
-                            <span className="flex-1 text-xs text-slate-300 font-mono truncate">
-                                {key}
-                            </span>
-                            <span className="text-xs text-slate-500 font-mono tabular-nums">
-                                {getLatestValue(key)}
-                            </span>
-                            <TrendingUp size={10} className="text-slate-600" />
-                        </div>
+                            seriesKey={key}
+                            data={timeSeriesData.get(key)}
+                        />
                     ))
                 )}
             </div>

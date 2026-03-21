@@ -100,4 +100,5 @@ export interface DataContextType {
   sendControlUpdate: (payload: Partial<ControlParams>) => boolean;
   rootPanel: PanelNode;
   setRootPanel: React.Dispatch<React.SetStateAction<PanelNode>>;
+  videoFrameUrl: string | null;
 }

@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"log"
@@ -37,8 +39,12 @@ const (
 
 	dataPushInterval   = 40 * time.Millisecond  // 25Hz
 	mapPushInterval    = 200 * time.Millisecond // 5Hz
+	videoPushInterval  = 100 * time.Millisecond // 10Hz
 	statusPushInterval = 1 * time.Second
 	writeTimeout       = 2 * time.Second
+
+	videoFrameMagic = 0x56494400 // "VID\0"
+	jpegQuality     = 80
 )
 
 // ShmHeader 必须与 C++ 端的 shm_layout.hpp 严格对齐。
@@ -415,6 +421,40 @@ func encodeRGBAToPNG(width, height int, rgba []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func encodeRGBAToJPEG(width, height int, rgba []byte, quality int) ([]byte, error) {
+	if width <= 0 || height <= 0 {
+		return nil, errors.New("invalid frame dimensions")
+	}
+	expectedSize := width * height * 4
+	if expectedSize <= 0 || len(rgba) < expectedSize {
+		return nil, errors.New("invalid frame payload")
+	}
+
+	img := &image.RGBA{
+		Pix:    rgba[:expectedSize],
+		Stride: width * 4,
+		Rect:   image.Rect(0, 0, width, height),
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// buildVideoFrame 拼装二进制视频帧：16 字节 header + JPEG payload。
+// Header: [4B magic "VID\0"] [8B timestamp LE] [2B width LE] [2B height LE]
+func buildVideoFrame(ts uint64, width, height int, jpegData []byte) []byte {
+	frame := make([]byte, 16+len(jpegData))
+	binary.LittleEndian.PutUint32(frame[0:4], videoFrameMagic)
+	binary.LittleEndian.PutUint64(frame[4:12], ts)
+	binary.LittleEndian.PutUint16(frame[12:14], uint16(width))
+	binary.LittleEndian.PutUint16(frame[14:16], uint16(height))
+	copy(frame[16:], jpegData)
+	return frame
+}
+
 func killProcessesByName(name string) (int, error) {
 	if name == "" {
 		return 0, errors.New("empty process name")
@@ -592,9 +632,11 @@ func main() {
 
 		dataTicker := time.NewTicker(dataPushInterval)
 		mapTicker := time.NewTicker(mapPushInterval)
+		videoTicker := time.NewTicker(videoPushInterval)
 		statusTicker := time.NewTicker(statusPushInterval)
 		defer dataTicker.Stop()
 		defer mapTicker.Stop()
+		defer videoTicker.Stop()
 		defer statusTicker.Stop()
 
 		for {
@@ -643,6 +685,22 @@ func main() {
 					Height:    esdfHeight,
 					Grid:      grid,
 				}); err != nil {
+					return
+				}
+			case <-videoTicker.C:
+				ts, width, height, rgba, ok := shm.ReadImageSnapshot()
+				if !ok {
+					continue
+				}
+
+				jpegBytes, err := encodeRGBAToJPEG(width, height, rgba, jpegQuality)
+				if err != nil {
+					continue
+				}
+
+				frame := buildVideoFrame(ts, width, height, jpegBytes)
+				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 					return
 				}
 			case <-statusTicker.C:
@@ -699,18 +757,18 @@ func main() {
 			return
 		}
 
-		pngBytes, err := encodeRGBAToPNG(width, height, rgba)
+		jpegBytes, err := encodeRGBAToJPEG(width, height, rgba, jpegQuality)
 		if err != nil {
 			http.Error(w, "failed to encode frame", http.StatusInternalServerError)
 			return
 		}
 
-		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Type", "image/jpeg")
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("X-Frame-Timestamp", strconv.FormatUint(ts, 10))
 		w.Header().Set("X-Frame-Width", strconv.Itoa(width))
 		w.Header().Set("X-Frame-Height", strconv.Itoa(height))
-		_, _ = w.Write(pngBytes)
+		_, _ = w.Write(jpegBytes)
 	})
 
 	http.HandleFunc("/api/process/kill", func(w http.ResponseWriter, r *http.Request) {

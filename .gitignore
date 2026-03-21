@@ -1,3 +1,9 @@
 node_modules
 .vite
 dist
+
+# compiled binaries
+vision_producer
+backend/vision-backend
+*.o
+*.out

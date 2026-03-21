@@ -5,6 +5,7 @@ const MAX_DATA_POINTS = 240;
 const RECONNECT_MAX_DELAY_MS = 6000;
 const MAP_WIDTH = 100;
 const MAP_HEIGHT = 100;
+const VIDEO_FRAME_MAGIC = 0x56494400; // "VID\0"
 
 interface DataProviderProps {
     children: React.ReactNode;
@@ -33,6 +34,11 @@ const defaultSystemStatus: SystemStatus = {
     nucTemp: 0
 };
 
+function getDefaultWsUrl(): string {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/ws`;
+}
+
 const DataContext = createContext<DataContextType>({
     availableSeries: [],
     timeSeriesData: new Map(),
@@ -42,13 +48,14 @@ const DataContext = createContext<DataContextType>({
     sendControlUpdate: () => false,
     rootPanel: defaultRootPanel,
     setRootPanel: () => { },
+    videoFrameUrl: null,
 });
 
 export const useDataContext = () => useContext(DataContext);
 
 export const DataProvider: React.FC<DataProviderProps> = ({
     children,
-    wsUrl = 'ws://localhost:5000/ws'
+    wsUrl
 }) => {
     const [availableSeries, setAvailableSeries] = useState<string[]>([]);
     const [timeSeriesData, setTimeSeriesData] = useState<Map<string, DataPoint[]>>(new Map());
@@ -56,12 +63,19 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     const [systemStatus, setSystemStatus] = useState<SystemStatus>(defaultSystemStatus);
     const [isConnected, setIsConnected] = useState(false);
     const [rootPanel, setRootPanel] = useState<PanelNode>(defaultRootPanel);
+    const [videoFrameUrl, setVideoFrameUrl] = useState<string | null>(null);
 
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimerRef = useRef<number | null>(null);
     const reconnectAttemptRef = useRef(0);
     const isDisposedRef = useRef(false);
     const knownSeriesRef = useRef<Set<string>>(new Set());
+    const prevVideoUrlRef = useRef<string | null>(null);
+
+    // rAF 批量更新缓冲
+    const pendingDataRef = useRef<{ timestamp: number; series: Record<string, number> }[]>([]);
+    const pendingSeriesKeysRef = useRef<string[]>([]);
+    const rafRef = useRef<number>(0);
 
     const mergeSeriesCatalog = useCallback((keys: string[]) => {
         let dirty = false;
@@ -75,6 +89,59 @@ export const DataProvider: React.FC<DataProviderProps> = ({
         if (dirty) {
             setAvailableSeries(Array.from(known).sort());
         }
+    }, []);
+
+    const flushBatch = useCallback(() => {
+        rafRef.current = 0;
+        const batch = pendingDataRef.current;
+        const newKeys = pendingSeriesKeysRef.current;
+        pendingDataRef.current = [];
+        pendingSeriesKeysRef.current = [];
+        if (batch.length === 0) return;
+
+        if (newKeys.length > 0) {
+            mergeSeriesCatalog(newKeys);
+        }
+
+        setTimeSeriesData(prev => {
+            const next = new Map(prev);
+            for (const msg of batch) {
+                for (const [key, value] of Object.entries(msg.series)) {
+                    if (!Number.isFinite(value)) continue;
+                    const arr = next.get(key);
+                    if (arr) {
+                        arr.push({ timestamp: msg.timestamp, value });
+                        while (arr.length > MAX_DATA_POINTS) arr.shift();
+                    } else {
+                        next.set(key, [{ timestamp: msg.timestamp, value }]);
+                    }
+                }
+            }
+            return next;
+        });
+    }, [mergeSeriesCatalog]);
+
+    const scheduleFlush = useCallback(() => {
+        if (!rafRef.current) {
+            rafRef.current = requestAnimationFrame(flushBatch);
+        }
+    }, [flushBatch]);
+
+    const handleVideoFrame = useCallback((buffer: ArrayBuffer) => {
+        if (buffer.byteLength < 16) return;
+        const view = new DataView(buffer);
+        const magic = view.getUint32(0, true);
+        if (magic !== VIDEO_FRAME_MAGIC) return;
+
+        const jpegData = buffer.slice(16);
+        const blob = new Blob([jpegData], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+
+        if (prevVideoUrlRef.current) {
+            URL.revokeObjectURL(prevVideoUrlRef.current);
+        }
+        prevVideoUrlRef.current = url;
+        setVideoFrameUrl(url);
     }, []);
 
     const sendControlUpdate = useCallback((payload: Partial<ControlParams>): boolean => {
@@ -93,6 +160,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({
 
     useEffect(() => {
         isDisposedRef.current = false;
+        const resolvedWsUrl = wsUrl || getDefaultWsUrl();
 
         const scheduleReconnect = (connectFn: () => void) => {
             if (isDisposedRef.current) return;
@@ -113,7 +181,8 @@ export const DataProvider: React.FC<DataProviderProps> = ({
             if (isDisposedRef.current) return;
 
             try {
-                const ws = new WebSocket(wsUrl);
+                const ws = new WebSocket(resolvedWsUrl);
+                ws.binaryType = 'arraybuffer';
                 wsRef.current = ws;
 
                 ws.onopen = () => {
@@ -123,6 +192,12 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                 };
 
                 ws.onmessage = (event) => {
+                    // 二进制消息 → 视频帧
+                    if (event.data instanceof ArrayBuffer) {
+                        handleVideoFrame(event.data);
+                        return;
+                    }
+
                     let message: WSMessage;
                     try {
                         message = JSON.parse(event.data) as WSMessage;
@@ -139,19 +214,16 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                         const entries = Object.entries(message.series).filter(([, value]) => Number.isFinite(value));
                         if (entries.length === 0) return;
 
-                        mergeSeriesCatalog(entries.map(([key]) => key));
-                        setTimeSeriesData(prev => {
-                            const next = new Map(prev);
-                            entries.forEach(([key, value]) => {
-                                const existingData = next.get(key) || [];
-                                const nextSeries = existingData.length >= MAX_DATA_POINTS
-                                    ? existingData.slice(existingData.length - (MAX_DATA_POINTS - 1))
-                                    : existingData.slice();
-                                nextSeries.push({ timestamp: message.timestamp, value });
-                                next.set(key, nextSeries);
-                            });
-                            return next;
-                        });
+                        // 收集新 series key
+                        const known = knownSeriesRef.current;
+                        for (const [key] of entries) {
+                            if (!known.has(key)) {
+                                pendingSeriesKeysRef.current.push(key);
+                            }
+                        }
+
+                        pendingDataRef.current.push({ timestamp: message.timestamp, series: message.series });
+                        scheduleFlush();
                         return;
                     }
 
@@ -204,12 +276,20 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                 window.clearTimeout(reconnectTimerRef.current);
                 reconnectTimerRef.current = null;
             }
+            if (rafRef.current) {
+                cancelAnimationFrame(rafRef.current);
+                rafRef.current = 0;
+            }
             if (wsRef.current) {
                 wsRef.current.close();
                 wsRef.current = null;
             }
+            if (prevVideoUrlRef.current) {
+                URL.revokeObjectURL(prevVideoUrlRef.current);
+                prevVideoUrlRef.current = null;
+            }
         };
-    }, [mergeSeriesCatalog, wsUrl]);
+    }, [mergeSeriesCatalog, wsUrl, handleVideoFrame, scheduleFlush]);
 
     return (
         <DataContext.Provider
@@ -221,7 +301,8 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                 isConnected,
                 sendControlUpdate,
                 rootPanel,
-                setRootPanel
+                setRootPanel,
+                videoFrameUrl,
             }}
         >
             {children}
