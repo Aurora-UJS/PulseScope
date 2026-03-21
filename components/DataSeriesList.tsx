@@ -32,9 +32,10 @@ const getSeriesColor = (key: string): string => {
 interface SeriesItemProps {
     seriesKey: string;
     data: DataPoint[] | undefined;
+    onClickAdd: (key: string) => void;
 }
 
-const SeriesItem = memo<SeriesItemProps>(({ seriesKey, data }) => {
+const SeriesItem = memo<SeriesItemProps>(({ seriesKey, data, onClickAdd }) => {
     const latestValue = data && data.length > 0 ? data[data.length - 1].value.toFixed(2) : '--';
     const color = getSeriesColor(seriesKey);
 
@@ -47,7 +48,8 @@ const SeriesItem = memo<SeriesItemProps>(({ seriesKey, data }) => {
         <div
             draggable
             onDragStart={handleDragStart}
-            className="flex items-center gap-2 px-2 py-1.5 bg-slate-800/30 hover:bg-slate-700/50 rounded cursor-grab active:cursor-grabbing transition-colors group"
+            onClick={() => onClickAdd(seriesKey)}
+            className="flex items-center gap-2 px-2 py-1.5 bg-slate-800/30 hover:bg-slate-700/50 rounded cursor-pointer active:bg-slate-600/50 transition-colors group"
         >
             <GripVertical size={12} className="text-slate-600 group-hover:text-slate-400" />
             <div
@@ -66,7 +68,7 @@ const SeriesItem = memo<SeriesItemProps>(({ seriesKey, data }) => {
 });
 
 const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
-    const { availableSeries, timeSeriesData, isConnected } = useDataContext();
+    const { availableSeries, timeSeriesData, isConnected, addSeriesToActivePanel } = useDataContext();
     const [searchQuery, setSearchQuery] = useState('');
 
     const filteredSeries = availableSeries.filter(key =>
@@ -111,6 +113,7 @@ const DataSeriesList: React.FC<Props> = ({ className = '' }) => {
                             key={key}
                             seriesKey={key}
                             data={timeSeriesData.get(key)}
+                            onClickAdd={addSeriesToActivePanel}
                         />
                     ))
                 )}

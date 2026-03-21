@@ -123,7 +123,7 @@ const AppContent: React.FC = () => {
                     <VideoFeed />
                   </div>
                 )}
-                <div className="flex-1 min-w-[300px] bg-slate-900/40 border border-slate-800/50 rounded-lg p-2">
+                <div className="flex-1 min-w-[300px]">
                   <SplittablePlotContainer />
                 </div>
               </div>

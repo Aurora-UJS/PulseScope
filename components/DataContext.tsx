@@ -7,6 +7,8 @@ const MAP_WIDTH = 100;
 const MAP_HEIGHT = 100;
 const VIDEO_FRAME_MAGIC = 0x56494400; // "VID\0"
 
+const LAYOUT_STORAGE_KEY = 'pulsescope_panel_layout';
+
 interface DataProviderProps {
     children: React.ReactNode;
     wsUrl?: string;
@@ -14,11 +16,39 @@ interface DataProviderProps {
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-const defaultRootPanel: PanelNode = {
-    id: generateId(),
-    type: 'leaf',
-    selectedSeries: []
-};
+function loadSavedLayout(): PanelNode {
+    try {
+        const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+        if (raw) {
+            const parsed = JSON.parse(raw) as PanelNode;
+            if (parsed && parsed.id && parsed.type) return parsed;
+        }
+    } catch { /* ignore */ }
+    return { id: generateId(), type: 'leaf', selectedSeries: [] };
+}
+
+function findFirstLeafId(node: PanelNode): string | null {
+    if (node.type === 'leaf') return node.id;
+    if (node.children) {
+        for (const child of node.children) {
+            const id = findFirstLeafId(child);
+            if (id) return id;
+        }
+    }
+    return null;
+}
+
+function addSeriesToNode(root: PanelNode, panelId: string, seriesKey: string): PanelNode {
+    if (root.id === panelId && root.type === 'leaf') {
+        const current = root.selectedSeries || [];
+        if (current.includes(seriesKey)) return root;
+        return { ...root, selectedSeries: [...current, seriesKey] };
+    }
+    if (root.type === 'split' && root.children) {
+        return { ...root, children: root.children.map(c => addSeriesToNode(c, panelId, seriesKey)) };
+    }
+    return root;
+}
 
 const defaultMapData: MapData = {
     width: MAP_WIDTH,
@@ -46,9 +76,12 @@ const DataContext = createContext<DataContextType>({
     systemStatus: defaultSystemStatus,
     isConnected: false,
     sendControlUpdate: () => false,
-    rootPanel: defaultRootPanel,
+    rootPanel: { id: '', type: 'leaf', selectedSeries: [] },
     setRootPanel: () => { },
     videoFrameUrl: null,
+    activePanelId: null,
+    setActivePanelId: () => { },
+    addSeriesToActivePanel: () => { },
 });
 
 export const useDataContext = () => useContext(DataContext);
@@ -62,8 +95,28 @@ export const DataProvider: React.FC<DataProviderProps> = ({
     const [mapData, setMapData] = useState<MapData>(defaultMapData);
     const [systemStatus, setSystemStatus] = useState<SystemStatus>(defaultSystemStatus);
     const [isConnected, setIsConnected] = useState(false);
-    const [rootPanel, setRootPanel] = useState<PanelNode>(defaultRootPanel);
+    const [rootPanel, setRootPanel] = useState<PanelNode>(loadSavedLayout);
     const [videoFrameUrl, setVideoFrameUrl] = useState<string | null>(null);
+    const [activePanelId, setActivePanelIdState] = useState<string | null>(() => findFirstLeafId(loadSavedLayout()));
+
+    // 面板布局持久化到 localStorage
+    useEffect(() => {
+        try {
+            localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(rootPanel));
+        } catch { /* quota exceeded etc. */ }
+    }, [rootPanel]);
+
+    const setActivePanelId = useCallback((id: string) => {
+        setActivePanelIdState(id);
+    }, []);
+
+    const addSeriesToActivePanel = useCallback((seriesKey: string) => {
+        setRootPanel(prev => {
+            const targetId = activePanelId || findFirstLeafId(prev);
+            if (!targetId) return prev;
+            return addSeriesToNode(prev, targetId, seriesKey);
+        });
+    }, [activePanelId]);
 
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimerRef = useRef<number | null>(null);
@@ -303,6 +356,9 @@ export const DataProvider: React.FC<DataProviderProps> = ({
                 rootPanel,
                 setRootPanel,
                 videoFrameUrl,
+                activePanelId,
+                setActivePanelId,
+                addSeriesToActivePanel,
             }}
         >
             {children}
