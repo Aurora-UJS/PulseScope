@@ -39,7 +39,7 @@ const (
 
 	dataPushInterval   = 40 * time.Millisecond  // 25Hz
 	mapPushInterval    = 200 * time.Millisecond // 5Hz
-	videoPushInterval  = 100 * time.Millisecond // 10Hz
+	videoPollInterval  = 1 * time.Millisecond   // 1kHz poll, actual rate follows producer
 	statusPushInterval = 1 * time.Second
 	writeTimeout       = 2 * time.Second
 
@@ -356,6 +356,38 @@ func (s *ShmRuntime) ReadImageSnapshot() (uint64, int, int, []byte, bool) {
 	return 0, 0, 0, nil, false
 }
 
+// PeekImageTimestamp 轻量级检查：仅在 seqlock 下读取图像时间戳，不拷贝 RGBA 缓冲区。
+func (s *ShmRuntime) PeekImageTimestamp() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.header == nil {
+		return 0, false
+	}
+
+	for i := 0; i < 3; i++ {
+		seq1 := s.header.Sequence
+		if seq1%2 == 1 {
+			runtime.Gosched()
+			continue
+		}
+
+		ts := s.header.TimestampMs
+		width := s.header.Width
+		height := s.header.Height
+
+		seq2 := s.header.Sequence
+		if seq1 != seq2 {
+			runtime.Gosched()
+			continue
+		}
+		if width == 0 || height == 0 {
+			return 0, false
+		}
+		return ts, true
+	}
+	return 0, false
+}
+
 // clamp 将值钳制到 [min, max] 区间内，防止非法参数写入 SHM
 func clamp(v, min, max float32) float32 {
 	if v < min {
@@ -632,12 +664,14 @@ func main() {
 
 		dataTicker := time.NewTicker(dataPushInterval)
 		mapTicker := time.NewTicker(mapPushInterval)
-		videoTicker := time.NewTicker(videoPushInterval)
+		videoPollTicker := time.NewTicker(videoPollInterval)
 		statusTicker := time.NewTicker(statusPushInterval)
 		defer dataTicker.Stop()
 		defer mapTicker.Stop()
-		defer videoTicker.Stop()
+		defer videoPollTicker.Stop()
 		defer statusTicker.Stop()
+
+		var lastVideoTs uint64
 
 		for {
 			select {
@@ -687,11 +721,16 @@ func main() {
 				}); err != nil {
 					return
 				}
-			case <-videoTicker.C:
+			case <-videoPollTicker.C:
+				ts, ok := shm.PeekImageTimestamp()
+				if !ok || ts == lastVideoTs {
+					continue
+				}
 				ts, width, height, rgba, ok := shm.ReadImageSnapshot()
 				if !ok {
 					continue
 				}
+				lastVideoTs = ts
 
 				jpegBytes, err := encodeRGBAToJPEG(width, height, rgba, jpegQuality)
 				if err != nil {
