@@ -356,3 +356,54 @@ func TestDirtySlotIsSkipped(t *testing.T) {
 		t.Errorf("Count = %d, len = %d, want 1 (dirty slot must be skipped)", resp.Count, len(resp.Params))
 	}
 }
+
+// ParamCount 必须与 ReadParams().Count 同口径（都跳过脏槽位）。两者若不一致，
+// 前端拿 /api/status 的 param_count 与 /api/params 的 count 相比会得到永久差值，
+// 每秒误判「参数集变了」并重新拉取——新数组引用会冲掉用户正在拖动的草稿值。
+func TestParamCountMatchesReadParamsCount(t *testing.T) {
+	dirty := ParamSlot{Type: paramTypeFloat, MinValue: 0, MaxValue: 1}
+	for i := range dirty.Key {
+		dirty.Key[i] = 'x'
+	}
+
+	rt := newFakeRuntime(
+		makeSlot("pid_p", paramTypeFloat, 1, 0, 10, 1, ""),
+		dirty,
+		makeSlot("pid_i", paramTypeFloat, 0, 0, 1, 0, ""),
+	)
+
+	resp, ok := rt.ReadParams()
+	if !ok {
+		t.Fatal("ReadParams failed")
+	}
+	if resp.Count != 2 {
+		t.Errorf("ReadParams().Count = %d, want 2 (dirty slot skipped)", resp.Count)
+	}
+	if got := rt.ParamCount(); got != resp.Count {
+		t.Errorf("ParamCount() = %d but ReadParams().Count = %d; the two must agree", got, resp.Count)
+	}
+}
+
+// 空 key 不得匹配脏槽位：cString 对无 NUL 结尾的数据同样返回空串，
+// 若不挡掉，读路径拒绝暴露的槽位反而能被写路径改到。
+func TestEmptyKeyDoesNotWriteDirtySlot(t *testing.T) {
+	dirty := ParamSlot{Type: paramTypeFloat, Value: 42, MinValue: 0, MaxValue: 100}
+	for i := range dirty.Key {
+		dirty.Key[i] = 'x'
+	}
+
+	rt := newFakeRuntime(dirty)
+
+	// 必须是 float64：toFloat 只接受 JSON number，传 Go int 会在到达
+	// findSlotLocked 之前就以类型非法被拒，测不到空 key 这条路径。
+	rejected, ok := rt.ApplyControl(ControlUpdate{"": float64(7)})
+	if !ok {
+		t.Fatal("ApplyControl failed")
+	}
+	if rt.ctrl.Params[0].Value != 42 {
+		t.Errorf("dirty slot written through empty key: Value = %v, want 42", rt.ctrl.Params[0].Value)
+	}
+	if len(rejected) != 1 {
+		t.Errorf("rejected = %v, want the empty key reported as rejected", rejected)
+	}
+}

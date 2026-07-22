@@ -243,6 +243,11 @@ func (s *ShmRuntime) paramCountLocked() uint32 {
 }
 
 func (s *ShmRuntime) findSlotLocked(key string, count uint32) *ParamSlot {
+	// cString 对脏槽位（key 无 NUL 结尾）也返回空串，空 key 会误匹配上它们——
+	// 那样读路径不暴露的槽位反而能被写路径改到。
+	if key == "" {
+		return nil
+	}
 	for i := uint32(0); i < count; i++ {
 		if cString(s.ctrl.Params[i].Key[:]) == key {
 			return &s.ctrl.Params[i]
@@ -251,13 +256,23 @@ func (s *ShmRuntime) findSlotLocked(key string, count uint32) *ParamSlot {
 	return nil
 }
 
+// ParamCount 必须与 ReadParams 同口径（都跳过脏槽位）。两者若不一致，前端拿
+// /api/status 的 param_count 与 /api/params 的 count 相比会得到永久差值，
+// 每秒误判「参数集变了」并重新拉取——新数组引用会冲掉用户正在拖动的草稿值。
 func (s *ShmRuntime) ParamCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.validLocked() {
 		return 0
 	}
-	return int(s.paramCountLocked())
+	count := s.paramCountLocked()
+	n := 0
+	for i := uint32(0); i < count; i++ {
+		if cString(s.ctrl.Params[i].Key[:]) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // HeartbeatAgeMs 返回距 producer 上次 commit 的毫秒数，未知返回 -1。
