@@ -1,19 +1,28 @@
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertCircle, Cpu, ExternalLink, HeartPulse } from 'lucide-react';
 import ParamPanel from './components/ParamPanel';
 import ConsoleLog from './components/ConsoleLog';
 import StatusCard from './components/StatusCard';
-import { BackendStatus, ControlParams, LogEntry, LogLevel } from './type';
+import {
+  BackendStatus, ControlResponse, ControlUpdate,
+  LogEntry, LogLevel, ParamInfo, ParamsResponse
+} from './type';
 
 // 控制面板：参数写回 + 运维（producer 状态 / kill）。
 // 观测面（时序曲线 / 视频 / 地图）在 Rerun Viewer 中查看，不在本页面。
+//
+// 参数表完全由 producer 声明驱动：本文件不含任何参数名或范围。
 const App: React.FC = () => {
-  const [applied, setApplied] = useState<ControlParams | null>(null);
+  const [params, setParams] = useState<ParamInfo[] | null>(null);
   const [status, setStatus] = useState<BackendStatus | null>(null);
   const [backendUp, setBackendUp] = useState(false);
   const [isKillingProcess, setIsKillingProcess] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+
+  // 已加载参数表的规模。与 status.param_count 不一致即说明 producer
+  // 换了参数集（重启后增删了 declare），需要重新拉取。
+  const loadedCountRef = useRef<number>(-1);
 
   const addLog = useCallback((message: string, level: LogLevel = LogLevel.INFO) => {
     const newLog: LogEntry = {
@@ -27,16 +36,17 @@ const App: React.FC = () => {
     try {
       const resp = await fetch('/api/params');
       if (!resp.ok) return false;
-      setApplied(await resp.json() as ControlParams);
+      const data = await resp.json() as ParamsResponse;
+      setParams(data.params);
+      loadedCountRef.current = data.count;
       return true;
     } catch {
       return false;
     }
   }, []);
 
-  // 1Hz 状态轮询；参数未加载且 SHM 可用时顺带补拉
+  // 1Hz 状态轮询；参数集规模变化时重新拉取声明
   useEffect(() => {
-    let paramsLoaded = false;
     let cancelled = false;
 
     const tick = async () => {
@@ -50,8 +60,15 @@ const App: React.FC = () => {
         const st = await resp.json() as BackendStatus;
         setBackendUp(true);
         setStatus(st);
-        if (!paramsLoaded && st.shm_valid) {
-          paramsLoaded = await fetchParams();
+
+        if (!st.shm_valid) {
+          // 控制块不可用或版本不匹配：丢弃旧表，避免展示过期的参数声明
+          setParams(null);
+          loadedCountRef.current = -1;
+          return;
+        }
+        if (st.param_count !== loadedCountRef.current) {
+          await fetchParams();
         }
       } catch {
         if (!cancelled) setBackendUp(false);
@@ -63,23 +80,39 @@ const App: React.FC = () => {
     return () => { cancelled = true; clearInterval(timer); };
   }, [fetchParams]);
 
-  const handleSync = useCallback(async (p: ControlParams): Promise<boolean> => {
+  const handleSync = useCallback(async (updates: ControlUpdate): Promise<boolean> => {
+    const keys = Object.keys(updates);
+    if (keys.length === 0) return true;
+
     try {
       const resp = await fetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(p)
+        body: JSON.stringify(updates)
       });
       if (!resp.ok) {
         addLog(`param sync failed: ${await resp.text() || resp.statusText}`, LogLevel.ERROR);
         return false;
       }
-      const appliedParams = await resp.json() as ControlParams;
-      setApplied(appliedParams);
-      addLog(
-        `params synced: P=${appliedParams.pid_p.toFixed(2)} I=${appliedParams.pid_i.toFixed(3)} D=${appliedParams.pid_d.toFixed(3)} EXP=${appliedParams.exposure} FIRE=${appliedParams.fire_enabled ? 1 : 0}`,
-        LogLevel.INFO
-      );
+
+      const data = await resp.json() as ControlResponse;
+      setParams(data.params);
+      loadedCountRef.current = data.count;
+
+      // 回读值与请求值不同，说明被 producer 声明的区间钳制了
+      const appliedByKey = new Map(data.params.map(p => [p.key, p.value]));
+      const summary = keys.map(key => {
+        const raw = updates[key];
+        const want = typeof raw === 'boolean' ? (raw ? 1 : 0) : raw;
+        const got = appliedByKey.get(key);
+        if (got === undefined) return `${key}=?`;
+        return got !== want ? `${key}=${got}(clamped from ${want})` : `${key}=${got}`;
+      }).join(' ');
+      addLog(`params synced: ${summary}`, LogLevel.INFO);
+
+      if (data.rejected && data.rejected.length > 0) {
+        addLog(`rejected: ${data.rejected.join('; ')}`, LogLevel.WARN);
+      }
       return true;
     } catch (err) {
       addLog(`param sync error: ${err instanceof Error ? err.message : String(err)}`, LogLevel.ERROR);
@@ -152,18 +185,24 @@ const App: React.FC = () => {
           <StatusCard
             label="SHM"
             value={status?.shm_valid ? 'VALID' : status?.shm_attached ? 'STALE' : 'N/A'}
-            subValue="/aurora_rm_ctrl"
+            subValue={status?.shm_valid ? `${status.param_count} params` : '/aurora_rm_ctrl'}
             icon={<Activity size={16} className="text-purple-400" />}
           />
         </div>
 
-        {applied ? (
-          <ParamPanel applied={applied} linkUp={backendUp && (status?.shm_valid ?? false)} onSync={handleSync} />
+        {params ? (
+          <ParamPanel
+            params={params}
+            linkUp={backendUp && (status?.shm_valid ?? false)}
+            onSync={handleSync}
+          />
         ) : (
           <div className="bg-slate-900/60 border border-slate-800/50 rounded-xl p-8 text-center text-sm text-slate-500">
-            {backendUp
-              ? '等待 producer 创建控制共享内存（/dev/shm/aurora_rm_ctrl）…'
-              : '后端不可达，请先启动 backend（:5000）'}
+            {!backendUp
+              ? '后端不可达，请先启动 backend（:5000）'
+              : status?.shm_attached
+                ? '控制块版本不匹配（需要 v4），请确认 producer 与 backend 版本一致'
+                : '等待 producer 创建控制共享内存（/dev/shm/aurora_rm_ctrl）…'}
           </div>
         )}
 
