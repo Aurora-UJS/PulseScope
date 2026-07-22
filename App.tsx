@@ -1,46 +1,91 @@
 
-import React, { useState, useMemo, useCallback } from 'react';
-import {
-  Cpu,
-  Video,
-  AlertCircle,
-  Eye,
-  EyeOff
-} from 'lucide-react';
-import VideoFeed from './components/VideoFeed';
-import SplittablePlotContainer from './components/SplittablePlotContainer';
-import { DataProvider, useDataContext } from './components/DataContext';
-import DataSeriesList from './components/DataSeriesList';
-import Sidebar from './components/Sidebar';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Activity, AlertCircle, Cpu, ExternalLink, HeartPulse } from 'lucide-react';
+import ParamPanel from './components/ParamPanel';
 import ConsoleLog from './components/ConsoleLog';
 import StatusCard from './components/StatusCard';
-import MapView from './components/MapView';
-import ParamPanel from './components/ParamPanel';
-import { LogEntry, LogLevel, ControlParams } from './type';
+import { BackendStatus, ControlParams, LogEntry, LogLevel } from './type';
 
-const AppContent: React.FC = () => {
-  const { mapData, systemStatus, isConnected, videoFps } = useDataContext();
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'navigation' | 'tuning'>('dashboard');
-  const [showVideoFeed, setShowVideoFeed] = useState(false);
+// 控制面板：参数写回 + 运维（producer 状态 / kill）。
+// 观测面（时序曲线 / 视频 / 地图）在 Rerun Viewer 中查看，不在本页面。
+const App: React.FC = () => {
+  const [applied, setApplied] = useState<ControlParams | null>(null);
+  const [status, setStatus] = useState<BackendStatus | null>(null);
+  const [backendUp, setBackendUp] = useState(false);
   const [isKillingProcess, setIsKillingProcess] = useState(false);
-  const [params, setParams] = useState<ControlParams>({
-    pid_p: 1.2, pid_i: 0.05, pid_d: 0.1, exposure: 5000, fire_enabled: true
-  });
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const addLog = useCallback((message: string, level: LogLevel = LogLevel.INFO) => {
     const newLog: LogEntry = {
-      id: Math.random().toString(36).substr(2, 9),
+      id: Math.random().toString(36).substring(2, 11),
       level, message, time: new Date().toLocaleTimeString()
     };
     setLogs(prev => [newLog, ...prev].slice(0, 50));
   }, []);
 
-  const mergedStatus = useMemo(() => ({
-    ...systemStatus,
-    backendConnected: isConnected && systemStatus.backendConnected
-  }), [isConnected, systemStatus]);
+  const fetchParams = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/params');
+      if (!resp.ok) return false;
+      setApplied(await resp.json() as ControlParams);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
 
+  // 1Hz 状态轮询；参数未加载且 SHM 可用时顺带补拉
+  useEffect(() => {
+    let paramsLoaded = false;
+    let cancelled = false;
+
+    const tick = async () => {
+      try {
+        const resp = await fetch('/api/status');
+        if (cancelled) return;
+        if (!resp.ok) {
+          setBackendUp(false);
+          return;
+        }
+        const st = await resp.json() as BackendStatus;
+        setBackendUp(true);
+        setStatus(st);
+        if (!paramsLoaded && st.shm_valid) {
+          paramsLoaded = await fetchParams();
+        }
+      } catch {
+        if (!cancelled) setBackendUp(false);
+      }
+    };
+
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [fetchParams]);
+
+  const handleSync = useCallback(async (p: ControlParams): Promise<boolean> => {
+    try {
+      const resp = await fetch('/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(p)
+      });
+      if (!resp.ok) {
+        addLog(`param sync failed: ${await resp.text() || resp.statusText}`, LogLevel.ERROR);
+        return false;
+      }
+      const appliedParams = await resp.json() as ControlParams;
+      setApplied(appliedParams);
+      addLog(
+        `params synced: P=${appliedParams.pid_p.toFixed(2)} I=${appliedParams.pid_i.toFixed(3)} D=${appliedParams.pid_d.toFixed(3)} EXP=${appliedParams.exposure} FIRE=${appliedParams.fire_enabled ? 1 : 0}`,
+        LogLevel.INFO
+      );
+      return true;
+    } catch (err) {
+      addLog(`param sync error: ${err instanceof Error ? err.message : String(err)}`, LogLevel.ERROR);
+      return false;
+    }
+  }, [addLog]);
 
   const handleKillProcess = useCallback(async () => {
     if (isKillingProcess) return;
@@ -68,100 +113,78 @@ const AppContent: React.FC = () => {
     }
   }, [addLog, isKillingProcess]);
 
+  const producerAlive = backendUp && (status?.producer_alive ?? false);
+
   return (
-    <div className="flex h-screen w-screen bg-slate-950 font-sans selection:bg-cyan-500/30">
-      <Sidebar status={mergedStatus} activeTab={activeTab} onTabChange={setActiveTab} />
-
-      <main className="flex-1 flex flex-col overflow-hidden border-l border-slate-800/50">
-        <header className="h-14 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur-md border-b border-slate-800/50">
-          <div className="flex items-center gap-4">
-            <h1 className="text-sm font-bold tracking-widest text-slate-200 uppercase">
-              {activeTab === 'dashboard' && 'Combat Dashboard'}
-              {activeTab === 'navigation' && 'ESDF Navigation Map'}
-              {activeTab === 'tuning' && 'Dynamic Parameter Tuning'}
-            </h1>
-            <div className="h-4 w-[1px] bg-slate-700"></div>
-            <div className={`flex items-center gap-2 text-xs ${mergedStatus.shmActive ? 'text-cyan-400' : 'text-amber-400'}`}>
-              <div className={`w-2 h-2 rounded-full animate-pulse ${mergedStatus.shmActive ? 'bg-cyan-400' : 'bg-amber-400'}`}></div>
-              {mergedStatus.shmActive ? 'SHM_LINK_ACTIVE' : 'SHM_LINK_DEGRADED'}
-            </div>
+    <div className="min-h-screen w-screen bg-slate-950 font-sans selection:bg-cyan-500/30 text-slate-200">
+      <header className="h-14 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur-md border-b border-slate-800/50">
+        <div className="flex items-center gap-4">
+          <h1 className="text-sm font-bold tracking-widest uppercase">PulseScope Control</h1>
+          <div className="h-4 w-[1px] bg-slate-700"></div>
+          <div className={`flex items-center gap-2 text-xs ${producerAlive ? 'text-cyan-400' : 'text-amber-400'}`}>
+            <div className={`w-2 h-2 rounded-full animate-pulse ${producerAlive ? 'bg-cyan-400' : 'bg-amber-400'}`}></div>
+            {!backendUp ? 'BACKEND_DOWN' : producerAlive ? 'PRODUCER_ALIVE' : 'PRODUCER_OFFLINE'}
           </div>
-          <div className="flex gap-2">
-            {activeTab === 'dashboard' && (
-              <button
-                onClick={() => setShowVideoFeed(!showVideoFeed)}
-                className={`px-3 py-1 text-xs rounded border transition-all flex items-center gap-2 ${showVideoFeed
-                  ? 'bg-cyan-900/20 hover:bg-cyan-900/40 text-cyan-400 border-cyan-900/50'
-                  : 'bg-slate-800/50 hover:bg-slate-700/50 text-slate-400 border-slate-700/50'
-                  }`}
-              >
-                {showVideoFeed ? <Eye size={14} /> : <EyeOff size={14} />}
-                Video
-              </button>
-            )}
-            <button
-              onClick={handleKillProcess}
-              disabled={isKillingProcess}
-              className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2"
-            >
-              <AlertCircle size={14} /> {isKillingProcess ? 'KILLING...' : 'KILL_PROCESS'}
-            </button>
+        </div>
+        <button
+          onClick={handleKillProcess}
+          disabled={isKillingProcess}
+          className="px-3 py-1 bg-red-900/20 hover:bg-red-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-red-400 text-xs rounded border border-red-900/50 transition-all flex items-center gap-2"
+        >
+          <AlertCircle size={14} /> {isKillingProcess ? 'KILLING...' : 'KILL_PROCESS'}
+        </button>
+      </header>
+
+      <main className="max-w-4xl mx-auto p-6 flex flex-col gap-6">
+        <div className="grid grid-cols-3 gap-3">
+          <StatusCard
+            label="NUC"
+            value={status ? `${status.nuc_cpu_load.toFixed(0)}%` : '--'}
+            subValue={status ? `${status.nuc_temp.toFixed(0)}°C` : ''}
+            icon={<Cpu size={16} className="text-orange-400" />}
+          />
+          <StatusCard
+            label="Heartbeat"
+            value={status && status.heartbeat_age_ms >= 0 ? `${status.heartbeat_age_ms}ms` : '--'}
+            subValue="age"
+            icon={<HeartPulse size={16} className="text-rose-400" />}
+          />
+          <StatusCard
+            label="SHM"
+            value={status?.shm_valid ? 'VALID' : status?.shm_attached ? 'STALE' : 'N/A'}
+            subValue="/aurora_rm_ctrl"
+            icon={<Activity size={16} className="text-purple-400" />}
+          />
+        </div>
+
+        {applied ? (
+          <ParamPanel applied={applied} linkUp={backendUp && (status?.shm_valid ?? false)} onSync={handleSync} />
+        ) : (
+          <div className="bg-slate-900/60 border border-slate-800/50 rounded-xl p-8 text-center text-sm text-slate-500">
+            {backendUp
+              ? '等待 producer 创建控制共享内存（/dev/shm/aurora_rm_ctrl）…'
+              : '后端不可达，请先启动 backend（:5000）'}
           </div>
-        </header>
+        )}
 
-        <div className="flex-1 overflow-y-auto p-4 min-h-0">
-          {activeTab === 'dashboard' && (
-            <div className="h-full flex flex-col xl:flex-row gap-4">
-              <div className="flex-1 min-w-0 flex flex-row gap-4">
-                {showVideoFeed && (
-                  <div className="shrink-0 w-64 h-64 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden relative">
-                    <VideoFeed />
-                  </div>
-                )}
-                <div className="flex-1 min-w-[300px]">
-                  <SplittablePlotContainer />
-                </div>
-              </div>
-              <div className="w-full xl:w-64 shrink-0 flex flex-col gap-4">
-                <div className="grid grid-cols-2 gap-2">
-                  <StatusCard label="NUC" value={`${mergedStatus.nucCpuLoad.toFixed(0)}%`} subValue={`${mergedStatus.nucTemp.toFixed(0)}°C`} icon={<Cpu size={16} className="text-orange-400" />} />
-                  <StatusCard label="Vision" value={videoFps} subValue="FPS" icon={<Video size={16} className="text-purple-400" />} />
-                </div>
-                <div className="flex-1 min-h-[200px] border border-slate-800/50 rounded-lg overflow-hidden">
-                  <DataSeriesList />
-                </div>
-                <div className="h-40 bg-slate-900/80 border border-slate-800/50 rounded-lg flex flex-col overflow-hidden">
-                  <div className="px-3 py-1.5 border-b border-slate-800/50 text-xs font-bold text-slate-400 uppercase tracking-wider">Console</div>
-                  <ConsoleLog logs={logs} />
-                </div>
-              </div>
-            </div>
-          )}
+        <div className="bg-slate-900/40 border border-slate-800/50 rounded-lg p-4 flex items-start gap-3">
+          <ExternalLink size={16} className="text-cyan-500 mt-0.5 shrink-0" />
+          <p className="text-xs text-slate-400 leading-relaxed">
+            时序曲线、相机画面、ESDF 地图在 <span className="text-cyan-400 font-bold">Rerun Viewer</span> 中查看。
+            producer 默认自动拉起本机 viewer；远程部署时设
+            <code className="text-cyan-500 mx-1">PULSESCOPE_RERUN_CONNECT=rerun+http://&lt;host&gt;:9876/proxy</code>
+            连接已运行的 viewer，或设
+            <code className="text-cyan-500 mx-1">PULSESCOPE_RERUN_SAVE=xxx.rrd</code>
+            录制后离线回放。
+          </p>
+        </div>
 
-          {activeTab === 'navigation' && (
-            <div className="h-full flex flex-col gap-4">
-              <div className="flex-1 bg-slate-900/40 border border-slate-800/50 rounded-lg overflow-hidden p-4">
-                <MapView data={mapData} />
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'tuning' && (
-            <div className="max-w-4xl mx-auto py-8">
-              <ParamPanel params={params} onUpdate={setParams} addLog={addLog} />
-            </div>
-          )}
+        <div className="h-48 bg-slate-900/80 border border-slate-800/50 rounded-lg flex flex-col overflow-hidden">
+          <div className="px-3 py-1.5 border-b border-slate-800/50 text-xs font-bold text-slate-400 uppercase tracking-wider">Console</div>
+          <ConsoleLog logs={logs} />
         </div>
       </main>
     </div>
-  );
-};
-
-const App: React.FC = () => {
-  return (
-    <DataProvider>
-      <AppContent />
-    </DataProvider>
   );
 };
 

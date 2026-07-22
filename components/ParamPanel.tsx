@@ -1,38 +1,35 @@
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { SlidersHorizontal, Save } from 'lucide-react';
-import { ControlParams, LogLevel } from '../type';
-import { useDataContext } from './DataContext';
+import { ControlParams } from '../type';
 
 interface Props {
-  params: ControlParams;
-  onUpdate: (p: ControlParams) => void;
-  addLog: (msg: string, level: LogLevel) => void;
+  // 后端最近一次确认的参数（初始加载 / sync 响应），draft 以此为基准
+  applied: ControlParams;
+  linkUp: boolean;
+  onSync: (p: ControlParams) => Promise<boolean>;
 }
 
-const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
-  const { isConnected, sendControlUpdate } = useDataContext();
+const ParamPanel: React.FC<Props> = ({ applied, linkUp, onSync }) => {
+  const [draft, setDraft] = useState<ControlParams>(applied);
+  const [syncing, setSyncing] = useState(false);
 
-  const handleChange = (key: keyof ControlParams, val: any) => {
-    onUpdate({ ...params, [key]: val });
+  // 后端确认值变化时（初始加载、sync 后的 clamp 回读）对齐 UI
+  useEffect(() => {
+    setDraft(applied);
+  }, [applied]);
+
+  const handleChange = (key: keyof ControlParams, val: number | boolean) => {
+    setDraft(prev => ({ ...prev, [key]: val }));
   };
 
-  const syncToNuc = () => {
-    const ok = sendControlUpdate({
-      pid_p: params.pid_p,
-      pid_i: params.pid_i,
-      pid_d: params.pid_d,
-      exposure: params.exposure,
-      fire_enabled: params.fire_enabled,
-    });
-
-    if (ok) {
-      addLog(
-        `params synced: P=${params.pid_p.toFixed(2)} I=${params.pid_i.toFixed(2)} D=${params.pid_d.toFixed(2)} EXP=${params.exposure}`,
-        LogLevel.INFO
-      );
-    } else {
-      addLog("Failed to sync: WebSocket disconnected", LogLevel.ERROR);
+  const syncToNuc = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      await onSync(draft);
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -43,11 +40,15 @@ const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
           <SlidersHorizontal className="text-cyan-500" /> Dynamic Controller Tuning
         </h2>
         <div className="flex items-center gap-3">
-          <div className={`text-xs font-mono ${isConnected ? 'text-emerald-400' : 'text-amber-400'}`}>
-            {isConnected ? 'WS_LINK_UP' : 'WS_LINK_DOWN'}
+          <div className={`text-xs font-mono ${linkUp ? 'text-emerald-400' : 'text-amber-400'}`}>
+            {linkUp ? 'CTRL_LINK_UP' : 'CTRL_LINK_DOWN'}
           </div>
-          <button onClick={syncToNuc} className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-sm font-bold rounded-lg transition-all shadow-lg shadow-cyan-900/20">
-            <Save size={16} /> Sync to SHM
+          <button
+            onClick={syncToNuc}
+            disabled={syncing}
+            className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-bold rounded-lg transition-all shadow-lg shadow-cyan-900/20"
+          >
+            <Save size={16} /> {syncing ? 'Syncing...' : 'Sync to SHM'}
           </button>
         </div>
       </div>
@@ -63,14 +64,14 @@ const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
             <div key={item.key} className="space-y-2">
               <div className="flex justify-between">
                 <label className="text-sm font-medium text-slate-300 uppercase">{item.key.replace('_', ' ')}</label>
-                <span className="text-cyan-400 font-mono text-sm">{(params as any)[item.key]}</span>
+                <span className="text-cyan-400 font-mono text-sm">{(draft as any)[item.key]}</span>
               </div>
               <input
                 type="range"
                 min={item.min}
                 max={item.max}
                 step={item.step}
-                value={(params as any)[item.key]}
+                value={(draft as any)[item.key]}
                 onChange={(e) => handleChange(item.key as keyof ControlParams, parseFloat(e.target.value))}
                 className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-500"
               />
@@ -83,14 +84,14 @@ const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
           <div className="space-y-2">
             <div className="flex justify-between">
               <label className="text-sm font-medium text-slate-300 uppercase">Exposure</label>
-              <span className="text-cyan-400 font-mono text-sm">{params.exposure}</span>
+              <span className="text-cyan-400 font-mono text-sm">{draft.exposure}</span>
             </div>
             <input
               type="range"
               min={100}
               max={50000}
               step={100}
-              value={params.exposure}
+              value={draft.exposure}
               onChange={(e) => handleChange('exposure', parseInt(e.target.value, 10))}
               className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-500"
             />
@@ -100,7 +101,7 @@ const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
             <span className="text-sm text-slate-300">Fire Enabled</span>
             <input
               type="checkbox"
-              checked={params.fire_enabled}
+              checked={draft.fire_enabled}
               onChange={(e) => handleChange('fire_enabled', e.target.checked)}
               className="h-4 w-4 accent-cyan-500"
             />
@@ -109,8 +110,9 @@ const ParamPanel: React.FC<Props> = ({ params, onUpdate, addLog }) => {
           <div className="p-4 bg-slate-800/50 rounded-lg border border-slate-700/30">
             <p className="text-sm font-bold mb-2 text-slate-400">Notes</p>
             <p className="text-[11px] text-slate-500 leading-relaxed">
-              Parameters are written directly to shared memory through the existing websocket session.
-              The C++ loop reads them on the next cycle via `syncParams`.
+              Sync 通过 <code className="text-cyan-500">POST /api/control</code> 写入共享内存控制块，
+              C++ 侧在下一帧 <code className="text-cyan-500">syncParams</code> 读取。
+              返回值为 clamp 后的生效参数，UI 会自动对齐。
             </p>
           </div>
         </section>

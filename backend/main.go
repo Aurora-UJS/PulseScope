@@ -1,69 +1,47 @@
 package main
 
+// PulseScope 控制面后端。
+//
+// 观测面数据（时序/图像/地图）已迁移到 Rerun SDK（producer 直连 viewer），
+// 本服务只负责控制面：
+//   - 参数写回：前端 HTTP → SHM 控制块 → producer syncParams 读取
+//   - 运维：producer 心跳/存活、CPU 负载/温度、进程终止
+//
+// SHM 布局必须与 C++ 端 include/shm_layout.hpp 的 ShmControlBlock 严格对齐。
+
 import (
-	"bytes"
-	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
-	"image/jpeg"
-	"image/png"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
-	shmPath         = "/dev/shm/vision_debug_shm"
-	shmTotalSize    = 10 * 1024 * 1024 // 10MB
-	maxImageBytes   = 4 * 1024 * 1024
-	esdfCells       = 10000
-	esdfWidth       = 100
-	esdfHeight      = 100
-	expectedMagic   = 0x564953494F4E3031
-	expectedVersion = 2
+	shmPath         = "/dev/shm/aurora_rm_ctrl"
+	shmSize         = 4096
+	expectedMagic   = 0x564953494F4E3031 // "VISION01"
+	expectedVersion = 3
 
-	dataPushInterval   = 40 * time.Millisecond  // 25Hz
-	mapPushInterval    = 200 * time.Millisecond // 5Hz
-	videoPollInterval  = 1 * time.Millisecond   // 1kHz poll, actual rate follows producer
-	statusPushInterval = 1 * time.Second
-	writeTimeout       = 2 * time.Second
-
-	videoFrameMagic = 0x56494400 // "VID\0"
-	jpegQuality     = 80
+	// producer 每帧 commit 刷新心跳（默认 50Hz），2s 无更新视为离线
+	heartbeatTimeout = 2 * time.Second
 )
 
-// ShmHeader 必须与 C++ 端的 shm_layout.hpp 严格对齐。
-type ShmHeader struct {
-	MagicNumber uint64
-	Version     uint64
-	Sequence    uint64
-	TimestampMs uint64
-
-	ImgOffset uint64
-	ImgSize   uint64
-	Width     uint32
-	Height    uint32
-
-	JsonOffset uint64
-	JsonSize   uint64
-
-	EsdfMap [10000]float32
-
+// ShmControlBlock 与 C++ 端 shm_layout.hpp 逐字段对齐（pack(8)，自然对齐无补齐）。
+type ShmControlBlock struct {
+	MagicNumber  uint64
+	Version      uint64
+	HeartbeatMs  uint64
 	PidP         float32
 	PidI         float32
 	PidD         float32
@@ -80,33 +58,22 @@ type ControlUpdate struct {
 	FireEnabled *bool    `json:"fire_enabled"`
 }
 
-type MetadataMessage struct {
-	Type            string   `json:"type"`
-	AvailableSeries []string `json:"available_series"`
+type ParamsResponse struct {
+	PidP        float32 `json:"pid_p"`
+	PidI        float32 `json:"pid_i"`
+	PidD        float32 `json:"pid_d"`
+	Exposure    uint32  `json:"exposure"`
+	FireEnabled bool    `json:"fire_enabled"`
 }
 
-type DataMessage struct {
-	Type      string             `json:"type"`
-	Timestamp uint64             `json:"timestamp"`
-	Series    map[string]float64 `json:"series"`
-}
-
-type MapMessage struct {
-	Type      string    `json:"type"`
-	Timestamp uint64    `json:"timestamp"`
-	Width     int       `json:"width"`
-	Height    int       `json:"height"`
-	Grid      []float32 `json:"grid"`
-}
-
-type StatusMessage struct {
-	Type             string  `json:"type"`
-	Timestamp        int64   `json:"timestamp"`
-	BackendConnected bool    `json:"backend_connected"`
-	ShmActive        bool    `json:"shm_active"`
-	SerialPort       string  `json:"serial_port"`
-	NucCpuLoad       float64 `json:"nuc_cpu_load"`
-	NucTemp          float64 `json:"nuc_temp"`
+type StatusResponse struct {
+	Timestamp      int64   `json:"timestamp"`
+	ShmAttached    bool    `json:"shm_attached"`
+	ShmValid       bool    `json:"shm_valid"`
+	ProducerAlive  bool    `json:"producer_alive"`
+	HeartbeatAgeMs int64   `json:"heartbeat_age_ms"` // -1 表示未知
+	NucCpuLoad     float64 `json:"nuc_cpu_load"`
+	NucTemp        float64 `json:"nuc_temp"`
 }
 
 type HealthResponse struct {
@@ -125,45 +92,57 @@ type KillProcessResponse struct {
 	KilledCount int    `json:"killed_count"`
 }
 
+// ShmRuntime 惰性挂载控制块：后端可先于 producer 启动，
+// 首次访问参数时再尝试 attach。
 type ShmRuntime struct {
-	mu     sync.Mutex
-	file   *os.File
-	data   []byte
-	header *ShmHeader
+	mu   sync.Mutex
+	file *os.File
+	data []byte
+	ctrl *ShmControlBlock
 }
 
-func (s *ShmRuntime) Attach(path string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *ShmRuntime) attachLocked() error {
+	if s.ctrl != nil {
+		return nil
+	}
 
-	f, err := os.OpenFile(path, os.O_RDWR, 0666)
+	f, err := os.OpenFile(shmPath, os.O_RDWR, 0666)
 	if err != nil {
 		return err
 	}
 
-	data, err := syscall.Mmap(int(f.Fd()), 0, shmTotalSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	if info.Size() < int64(unsafe.Sizeof(ShmControlBlock{})) {
+		_ = f.Close()
+		return fmt.Errorf("shm too small (%d bytes), stale producer?", info.Size())
+	}
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, shmSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		_ = f.Close()
 		return err
 	}
 
-	if len(data) < int(unsafe.Sizeof(ShmHeader{})) {
-		_ = syscall.Munmap(data)
-		_ = f.Close()
-		return errors.New("mapped shm too small for header")
-	}
-
-	header := (*ShmHeader)(unsafe.Pointer(&data[0]))
 	s.file = f
 	s.data = data
-	s.header = header
+	s.ctrl = (*ShmControlBlock)(unsafe.Pointer(&data[0]))
 	return nil
+}
+
+// EnsureAttached 尝试挂载（幂等）。返回 nil 表示 ctrl 可用。
+func (s *ShmRuntime) EnsureAttached() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attachLocked()
 }
 
 func (s *ShmRuntime) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if s.data != nil {
 		_ = syscall.Munmap(s.data)
 		s.data = nil
@@ -172,220 +151,88 @@ func (s *ShmRuntime) Close() {
 		_ = s.file.Close()
 		s.file = nil
 	}
-	s.header = nil
+	s.ctrl = nil
 }
 
 func (s *ShmRuntime) IsAttached() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.header != nil
+	return s.ctrl != nil
 }
 
 func (s *ShmRuntime) Version() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.header == nil {
+	if s.ctrl == nil {
 		return 0
 	}
-	return s.header.Version
+	return s.ctrl.Version
 }
 
-func (s *ShmRuntime) HeaderValid() bool {
+func (s *ShmRuntime) Valid() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.header == nil {
-		return false
+	return s.ctrl != nil && s.ctrl.MagicNumber == expectedMagic && s.ctrl.Version == expectedVersion
+}
+
+// HeartbeatAgeMs 返回距 producer 上次 commit 的毫秒数，未知返回 -1。
+func (s *ShmRuntime) HeartbeatAgeMs() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctrl == nil || s.ctrl.HeartbeatMs == 0 {
+		return -1
 	}
-	return s.header.MagicNumber == expectedMagic && s.header.Version == expectedVersion
+	age := time.Now().UnixMilli() - int64(s.ctrl.HeartbeatMs)
+	if age < 0 {
+		age = 0
+	}
+	return age
 }
 
-func (s *ShmRuntime) ApplyControl(update ControlUpdate) {
+func (s *ShmRuntime) ReadParams() (ParamsResponse, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ctrl == nil {
+		return ParamsResponse{}, false
+	}
+	return ParamsResponse{
+		PidP:        s.ctrl.PidP,
+		PidI:        s.ctrl.PidI,
+		PidD:        s.ctrl.PidD,
+		Exposure:    s.ctrl.ExposureTime,
+		FireEnabled: s.ctrl.IsFireEnable != 0,
+	}, true
+}
 
-	if s.header == nil {
-		return
+// ApplyControl 将参数写入 SHM（逐字段独立写，与 C++ 端约定一致：
+// 单字段自然对齐写入，不保证跨字段一致性——调参场景可容忍）。
+func (s *ShmRuntime) ApplyControl(update ControlUpdate) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctrl == nil {
+		return false
 	}
 
 	if update.PidP != nil {
-		s.header.PidP = clamp(*update.PidP, 0.0, 10.0)
+		s.ctrl.PidP = clamp(*update.PidP, 0.0, 10.0)
 	}
 	if update.PidI != nil {
-		s.header.PidI = clamp(*update.PidI, 0.0, 1.0)
+		s.ctrl.PidI = clamp(*update.PidI, 0.0, 1.0)
 	}
 	if update.PidD != nil {
-		s.header.PidD = clamp(*update.PidD, 0.0, 1.0)
+		s.ctrl.PidD = clamp(*update.PidD, 0.0, 1.0)
 	}
 	if update.Exposure != nil {
-		s.header.ExposureTime = uint32(clamp(*update.Exposure, 100, 50000))
+		s.ctrl.ExposureTime = uint32(clamp(*update.Exposure, 100, 50000))
 	}
 	if update.FireEnabled != nil {
 		if *update.FireEnabled {
-			s.header.IsFireEnable = 1
+			s.ctrl.IsFireEnable = 1
 		} else {
-			s.header.IsFireEnable = 0
+			s.ctrl.IsFireEnable = 0
 		}
 	}
-}
-
-func (s *ShmRuntime) ReadSeriesSnapshot() (uint64, map[string]float64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.header == nil || s.data == nil {
-		return 0, nil, false
-	}
-
-	for i := 0; i < 5; i++ {
-		seq1 := s.header.Sequence
-		if seq1%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-
-		jsonOffset := s.header.JsonOffset
-		jsonSize := s.header.JsonSize
-		timestamp := s.header.TimestampMs
-		pidP := s.header.PidP
-		pidI := s.header.PidI
-		pidD := s.header.PidD
-		exposure := s.header.ExposureTime
-		fireEnabled := s.header.IsFireEnable
-
-		var jsonCopy []byte
-		if jsonSize > 0 &&
-			jsonSize < 65536 &&
-			jsonOffset > 0 &&
-			jsonOffset+jsonSize <= uint64(len(s.data)) {
-			jsonCopy = make([]byte, int(jsonSize))
-			copy(jsonCopy, s.data[jsonOffset:jsonOffset+jsonSize])
-		}
-
-		seq2 := s.header.Sequence
-		if seq1 != seq2 || seq2%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-
-		series := make(map[string]float64, 16)
-		for k, v := range parseSeriesJSON(jsonCopy) {
-			series[k] = v
-		}
-
-		series["pid_p"] = float64(pidP)
-		series["pid_i"] = float64(pidI)
-		series["pid_d"] = float64(pidD)
-		series["exposure"] = float64(exposure)
-		series["fire_enabled"] = float64(fireEnabled)
-
-		return timestamp, series, true
-	}
-
-	return 0, nil, false
-}
-
-func (s *ShmRuntime) ReadMapSnapshot() (uint64, []float32, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.header == nil {
-		return 0, nil, false
-	}
-
-	for i := 0; i < 3; i++ {
-		seq1 := s.header.Sequence
-		if seq1%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-
-		ts := s.header.TimestampMs
-		grid := make([]float32, esdfCells)
-		copy(grid, s.header.EsdfMap[:])
-
-		seq2 := s.header.Sequence
-		if seq1 != seq2 || seq2%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-		return ts, grid, true
-	}
-	return 0, nil, false
-}
-
-func (s *ShmRuntime) ReadImageSnapshot() (uint64, int, int, []byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.header == nil || s.data == nil {
-		return 0, 0, 0, nil, false
-	}
-
-	for i := 0; i < 3; i++ {
-		seq1 := s.header.Sequence
-		if seq1%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-
-		ts := s.header.TimestampMs
-		imgOffset := s.header.ImgOffset
-		imgSize := s.header.ImgSize
-		width := int(s.header.Width)
-		height := int(s.header.Height)
-		if width <= 0 || height <= 0 || imgSize == 0 || imgSize > maxImageBytes {
-			return 0, 0, 0, nil, false
-		}
-
-		expectedSize := uint64(width) * uint64(height) * 4
-		if expectedSize == 0 || expectedSize > maxImageBytes || imgSize < expectedSize {
-			return 0, 0, 0, nil, false
-		}
-		if imgOffset == 0 || imgOffset+expectedSize > uint64(len(s.data)) {
-			return 0, 0, 0, nil, false
-		}
-
-		frame := make([]byte, int(expectedSize))
-		copy(frame, s.data[imgOffset:imgOffset+expectedSize])
-
-		seq2 := s.header.Sequence
-		if seq1 != seq2 || seq2%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-		return ts, width, height, frame, true
-	}
-
-	return 0, 0, 0, nil, false
-}
-
-// PeekImageTimestamp 轻量级检查：仅在 seqlock 下读取图像时间戳，不拷贝 RGBA 缓冲区。
-func (s *ShmRuntime) PeekImageTimestamp() (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.header == nil {
-		return 0, false
-	}
-
-	for i := 0; i < 3; i++ {
-		seq1 := s.header.Sequence
-		if seq1%2 == 1 {
-			runtime.Gosched()
-			continue
-		}
-
-		ts := s.header.TimestampMs
-		width := s.header.Width
-		height := s.header.Height
-
-		seq2 := s.header.Sequence
-		if seq1 != seq2 {
-			runtime.Gosched()
-			continue
-		}
-		if width == 0 || height == 0 {
-			return 0, false
-		}
-		return ts, true
-	}
-	return 0, false
+	return true
 }
 
 // clamp 将值钳制到 [min, max] 区间内，防止非法参数写入 SHM
@@ -397,94 +244,6 @@ func clamp(v, min, max float32) float32 {
 		return max
 	}
 	return v
-}
-
-func parseSeriesJSON(raw []byte) (out map[string]float64) {
-	out = make(map[string]float64)
-	if len(raw) == 0 {
-		return out
-	}
-
-	defer func() {
-		if recover() != nil {
-			out = make(map[string]float64)
-		}
-	}()
-
-	var payload map[string]interface{}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return out
-	}
-
-	for key, value := range payload {
-		switch v := value.(type) {
-		case float64:
-			out[key] = v
-		case bool:
-			if v {
-				out[key] = 1
-			} else {
-				out[key] = 0
-			}
-		}
-	}
-	return out
-}
-
-func encodeRGBAToPNG(width, height int, rgba []byte) ([]byte, error) {
-	if width <= 0 || height <= 0 {
-		return nil, errors.New("invalid frame dimensions")
-	}
-	expectedSize := width * height * 4
-	if expectedSize <= 0 || len(rgba) < expectedSize {
-		return nil, errors.New("invalid frame payload")
-	}
-
-	img := &image.RGBA{
-		Pix:    rgba[:expectedSize],
-		Stride: width * 4,
-		Rect:   image.Rect(0, 0, width, height),
-	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func encodeRGBAToJPEG(width, height int, rgba []byte, quality int) ([]byte, error) {
-	if width <= 0 || height <= 0 {
-		return nil, errors.New("invalid frame dimensions")
-	}
-	expectedSize := width * height * 4
-	if expectedSize <= 0 || len(rgba) < expectedSize {
-		return nil, errors.New("invalid frame payload")
-	}
-
-	img := &image.RGBA{
-		Pix:    rgba[:expectedSize],
-		Stride: width * 4,
-		Rect:   image.Rect(0, 0, width, height),
-	}
-
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// buildVideoFrame 拼装二进制视频帧：16 字节 header + JPEG payload。
-// Header: [4B magic "VID\0"] [8B timestamp LE] [2B width LE] [2B height LE]
-func buildVideoFrame(ts uint64, width, height int, jpegData []byte) []byte {
-	frame := make([]byte, 16+len(jpegData))
-	binary.LittleEndian.PutUint32(frame[0:4], videoFrameMagic)
-	binary.LittleEndian.PutUint64(frame[4:12], ts)
-	binary.LittleEndian.PutUint16(frame[12:14], uint16(width))
-	binary.LittleEndian.PutUint16(frame[14:16], uint16(height))
-	copy(frame[16:], jpegData)
-	return frame
 }
 
 func killProcessesByName(name string) (int, error) {
@@ -529,20 +288,6 @@ func killProcessesByName(name string) (int, error) {
 		return 0, fmt.Errorf("no process named %q found", name)
 	}
 	return killed, nil
-}
-
-func writeJSON(conn *websocket.Conn, payload interface{}) error {
-	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return conn.WriteJSON(payload)
-}
-
-func sortedSeriesKeys(series map[string]struct{}) []string {
-	keys := make([]string, 0, len(series))
-	for k := range series {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func readCPULoadPct() float64 {
@@ -590,181 +335,42 @@ func readCPUTempC() float64 {
 	return 0
 }
 
-// 限制 WebSocket 连接只允许来自本机前端，防止局域网恶意页面访问。
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		return origin == "http://localhost:3000" ||
-			origin == "http://127.0.0.1:3000" ||
-			origin == "http://localhost:5173" ||
-			origin == "http://127.0.0.1:5173"
-	},
+func writeJSON(w http.ResponseWriter, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func main() {
 	shm := &ShmRuntime{}
-
-	var attachErr error
-	for i := 0; i < 30; i++ {
-		attachErr = shm.Attach(shmPath)
-		if attachErr == nil {
-			break
-		}
-		fmt.Println("Waiting for SHM file...", attachErr)
-		time.Sleep(1 * time.Second)
-	}
-	if attachErr != nil {
-		log.Fatal("Could not open SHM. Is producer running?")
+	if err := shm.EnsureAttached(); err != nil {
+		fmt.Println("SHM not available yet (producer offline?), will retry on demand:", err)
 	}
 	defer shm.Close()
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-
-		knownSeries := map[string]struct{}{
-			"pid_p":        {},
-			"pid_i":        {},
-			"pid_d":        {},
-			"exposure":     {},
-			"fire_enabled": {},
-		}
-		if err := writeJSON(conn, MetadataMessage{
-			Type:            "metadata",
-			AvailableSeries: sortedSeriesKeys(knownSeries),
-		}); err != nil {
-			return
-		}
-
-		// 接收前端参数更新。
-		go func() {
-			defer cancel()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					_, message, err := conn.ReadMessage()
-					if err != nil {
-						return
-					}
-					var update ControlUpdate
-					if err := json.Unmarshal(message, &update); err == nil {
-						shm.ApplyControl(update)
-					}
-				}
-			}
-		}()
-
-		dataTicker := time.NewTicker(dataPushInterval)
-		mapTicker := time.NewTicker(mapPushInterval)
-		videoPollTicker := time.NewTicker(videoPollInterval)
-		statusTicker := time.NewTicker(statusPushInterval)
-		defer dataTicker.Stop()
-		defer mapTicker.Stop()
-		defer videoPollTicker.Stop()
-		defer statusTicker.Stop()
-
-		var lastVideoTs uint64
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-dataTicker.C:
-				ts, series, ok := shm.ReadSeriesSnapshot()
-				if !ok {
-					continue
-				}
-
-				metadataDirty := false
-				for key := range series {
-					if _, exists := knownSeries[key]; !exists {
-						knownSeries[key] = struct{}{}
-						metadataDirty = true
-					}
-				}
-				if metadataDirty {
-					if err := writeJSON(conn, MetadataMessage{
-						Type:            "metadata",
-						AvailableSeries: sortedSeriesKeys(knownSeries),
-					}); err != nil {
-						return
-					}
-				}
-
-				if err := writeJSON(conn, DataMessage{
-					Type:      "data",
-					Timestamp: ts,
-					Series:    series,
-				}); err != nil {
-					return
-				}
-			case <-mapTicker.C:
-				ts, grid, ok := shm.ReadMapSnapshot()
-				if !ok {
-					continue
-				}
-
-				if err := writeJSON(conn, MapMessage{
-					Type:      "map",
-					Timestamp: ts,
-					Width:     esdfWidth,
-					Height:    esdfHeight,
-					Grid:      grid,
-				}); err != nil {
-					return
-				}
-			case <-videoPollTicker.C:
-				ts, ok := shm.PeekImageTimestamp()
-				if !ok || ts == lastVideoTs {
-					continue
-				}
-				ts, width, height, rgba, ok := shm.ReadImageSnapshot()
-				if !ok {
-					continue
-				}
-				lastVideoTs = ts
-
-				jpegBytes, err := encodeRGBAToJPEG(width, height, rgba, jpegQuality)
-				if err != nil {
-					continue
-				}
-
-				frame := buildVideoFrame(ts, width, height, jpegBytes)
-				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-					return
-				}
-			case <-statusTicker.C:
-				if err := writeJSON(conn, StatusMessage{
-					Type:             "status",
-					Timestamp:        time.Now().UnixMilli(),
-					BackendConnected: true,
-					ShmActive:        shm.HeaderValid(),
-					SerialPort:       "/dev/ttyACM0",
-					NucCpuLoad:       readCPULoadPct(),
-					NucTemp:          readCPUTempC(),
-				}); err != nil {
-					return
-				}
-			}
-		}
-	})
-
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(HealthResponse{
+		_ = shm.EnsureAttached()
+		writeJSON(w, HealthResponse{
 			Status:      "ok",
 			ShmAttached: shm.IsAttached(),
 			Version:     shm.Version(),
 		})
+	})
+
+	http.HandleFunc("/api/params", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := shm.EnsureAttached(); err != nil {
+			http.Error(w, "control shm not available (producer offline?)", http.StatusServiceUnavailable)
+			return
+		}
+		params, ok := shm.ReadParams()
+		if !ok {
+			http.Error(w, "control shm not available", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, params)
 	})
 
 	http.HandleFunc("/api/control", func(w http.ResponseWriter, r *http.Request) {
@@ -778,36 +384,37 @@ func main() {
 			http.Error(w, "invalid json payload", http.StatusBadRequest)
 			return
 		}
-		shm.ApplyControl(update)
+		if err := shm.EnsureAttached(); err != nil {
+			http.Error(w, "control shm not available (producer offline?)", http.StatusServiceUnavailable)
+			return
+		}
+		if !shm.ApplyControl(update) {
+			http.Error(w, "control shm not available", http.StatusServiceUnavailable)
+			return
+		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		// 回读生效值（含 clamp 结果），前端据此对齐 UI
+		params, _ := shm.ReadParams()
+		writeJSON(w, params)
 	})
 
-	http.HandleFunc("/api/video/latest", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		_ = shm.EnsureAttached()
 
-		ts, width, height, rgba, ok := shm.ReadImageSnapshot()
-		if !ok {
-			http.Error(w, "no video frame available", http.StatusServiceUnavailable)
-			return
-		}
-
-		jpegBytes, err := encodeRGBAToJPEG(width, height, rgba, jpegQuality)
-		if err != nil {
-			http.Error(w, "failed to encode frame", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-		w.Header().Set("X-Frame-Timestamp", strconv.FormatUint(ts, 10))
-		w.Header().Set("X-Frame-Width", strconv.Itoa(width))
-		w.Header().Set("X-Frame-Height", strconv.Itoa(height))
-		_, _ = w.Write(jpegBytes)
+		age := shm.HeartbeatAgeMs()
+		writeJSON(w, StatusResponse{
+			Timestamp:      time.Now().UnixMilli(),
+			ShmAttached:    shm.IsAttached(),
+			ShmValid:       shm.Valid(),
+			ProducerAlive:  age >= 0 && age < heartbeatTimeout.Milliseconds(),
+			HeartbeatAgeMs: age,
+			NucCpuLoad:     readCPULoadPct(),
+			NucTemp:        readCPUTempC(),
+		})
 	})
 
 	http.HandleFunc("/api/process/kill", func(w http.ResponseWriter, r *http.Request) {
@@ -833,14 +440,13 @@ func main() {
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(KillProcessResponse{
+		writeJSON(w, KillProcessResponse{
 			Status:      "ok",
 			ProcessName: request.Name,
 			KilledCount: killed,
 		})
 	})
 
-	fmt.Println("PulseScope Backend running on :5000")
+	fmt.Println("PulseScope control-plane backend running on :5000")
 	log.Fatal(http.ListenAndServe(":5000", nil))
 }

@@ -17,5 +17,5 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["."],
-  "exclude": ["frontend"]
+  "exclude": ["frontend", "build", "node_modules", "dist"]
 }
