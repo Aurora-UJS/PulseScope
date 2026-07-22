@@ -1,148 +1,124 @@
 
-# PulseScope 部署指南
+# PulseScope
 
-> [!CAUTION]
-> **本项目仍在深度开发中，目前尚未进行完整测试，请谨慎使用！**
+机器人视觉程序的观测 + 调参工具。**观测面走 [Rerun](https://rerun.io)，控制面自建**：
 
-## 1. 准备工作
-- **操作系统**: 推荐 Ubuntu 20.04/22.04/24.04 (必须支持 `/dev/shm`)。
-- **依赖**:
-  - C++: `g++`, `cmake`
-  - Go: `golang-1.20+`
-  - Node.js: `v18+`
+```
+                    ┌─ Rerun SDK ──→ Rerun Viewer（时序曲线 / 相机画面 / ESDF 地图 / .rrd 录制回放）
+C++ Producer ───────┤
+                    └─ POSIX SHM（4KB 控制块）──→ Go Backend（:5000）──→ React 控制面板（:3000）
+                          ↑                            │
+                          └──── 参数写回（HTTP POST）────┘
+```
 
-## 2. 运行步骤
+- **观测面（Rerun）**：producer 通过 Rerun C++ SDK 直接把时序数据、视频帧、ESDF 地图
+  记录到 Rerun Viewer，支持时间轴回溯和 `.rrd` 文件录制/离线回放。
+- **控制面（自建）**：Rerun 是单向的（SDK → viewer），反向调参走 4KB 共享内存控制块，
+  Go 后端提供 HTTP API，前端是一个纯调参 + 运维面板（含进程 kill、心跳监控）。
 
-### 步骤 A: 启动 C++ 模拟生产者
-在 `src_cpp` 目录下编译运行示例程序：
+## 1. 依赖
+
+- **操作系统**: Linux（需要 `/dev/shm` 与 `/proc`）
+- **C++**: g++ (C++17), cmake ≥ 3.16，联网（首次构建 FetchContent 拉取 Rerun C++ SDK 与 Arrow）
+- **Go**: 1.20+
+- **Node.js**: v18+
+- **Rerun Viewer**（可选，用于查看/回放）: `pipx install rerun-sdk` 或 `cargo install rerun-cli`
+
+## 2. 构建与运行
+
+### 步骤 A: 构建并启动 C++ 生产者
+
 ```bash
-# 终端 1 - C++ 生产者
-g++ -std=c++17 src_cpp/main.cpp -o vision_producer -lrt -lpthread
-./vision_producer
-```
-这将创建 `/dev/shm/vision_debug_shm` 并开始写入数据。
+cmake -B build
+# CMake ≥ 4.0 需要兼容开关：Arrow 内嵌的 mimalloc 子构建声明了过旧的 cmake_minimum_required
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cmake --build build -j$(nproc)
 
-可选压力工况环境变量（用于大数据量测试）：
+# 终端 1 - 默认自动拉起本机 Rerun Viewer
+./build/vision_producer
+```
+
+Rerun sink 由环境变量选择（按优先级）：
+
+| 环境变量 | 行为 |
+|---|---|
+| `PULSESCOPE_RERUN_CONNECT=rerun+http://<host>:9876/proxy` | 连接已运行的 viewer（远程部署：机器人上跑 producer，PC 上跑 `rerun --serve`） |
+| `PULSESCOPE_RERUN_SAVE=run1.rrd` | 录制到文件，事后 `rerun run1.rrd` 回放 |
+| （都不设） | spawn 本机 viewer |
+
+压力工况环境变量：`PULSESCOPE_UPDATE_HZ`（默认 50）、`PULSESCOPE_MAP_HZ`（10）、
+`PULSESCOPE_STRESS_SERIES`（24，最大 512）、`PULSESCOPE_NOISE_LEVEL`（10）。
+
+### 步骤 B: 启动 Go 控制面后端
+
 ```bash
-# 示例：120Hz、32个压力通道、20Hz地图更新
-PULSESCOPE_UPDATE_HZ=120 \
-PULSESCOPE_STRESS_SERIES=32 \
-PULSESCOPE_MAP_HZ=20 \
-PULSESCOPE_NOISE_LEVEL=20 \
-./vision_producer
+# 终端 2
+cd backend && go run main.go   # 监听 :5000，producer 未启动也能起（惰性挂载 SHM）
 ```
 
-### 步骤 B: 启动 Go 后端
+### 步骤 C: 启动前端控制面板
+
 ```bash
-# 终端 2 - Go 后端
-cd backend
-go run main.go
-```
-后端将监听 `5000` 端口。
-
-### 步骤 C: 启动前端
-```bash
-# 终端 3 - 前端
-npm run dev
-```
-在浏览器打开 `http://localhost:3000`。
-
-## 3. 架构核心
-
-```
-C++ Producer ──→ POSIX SHM (10MB, 零拷贝) ──→ Go Backend ──→ WebSocket ──→ React 前端
-                                                  ↑                           │
-                                                  └── 参数写回 (WS JSON) ──────┘
+# 终端 3
+npm install && npm run dev     # http://localhost:3000
 ```
 
-- **低耦合**: C++ 进程崩溃不会影响后端，后端重启会自动重新挂载 SHM。
-- **高性能**: 图像数据通过内存偏移量直接读取，无需序列化；视频帧通过 WS 二进制通道推送（JPEG 编码），避免 HTTP 轮询开销。
-- **协议扩展**: 后端 WebSocket 推送 `metadata/data/map/status` 四类 JSON 消息 + `video` 二进制帧，前端实时订阅。
-- **反向调参**: 前端参数通过同一条 WS 链路写回 SHM，C++ 可在下一帧 `syncParams` 读取。
-- **渲染优化**: 前端使用 `requestAnimationFrame` 批量刷新时序数据，高 series 数（512+）下保持流畅。
+## 3. C++ 接口（业务代码接入）
 
-## 4. C++ 接口
+接口与 SHM 时代保持不变，业务代码无需改动：
 
-``` cpp
+```cpp
 #include "vision_monitor.hpp"
 
-// 初始化 (只需一次)
-vision::Monitor::getInstance().init();
+auto& mon = vision::Monitor::getInstance();
+mon.init();                          // 初始化 Rerun sink + 控制 SHM（只需一次）
 
-// 每帧推送数据
-vision::Monitor::getInstance().pushData("ekf_x", ekf_state.x);
-vision::Monitor::getInstance().pushData("ekf_y", ekf_state.y);
-vision::Monitor::getInstance().pushData("fps", current_fps);
+// 每帧：
+mon.pushData("ekf_x", ekf_state.x);  // 任意 key-value 时序数据
+mon.pushData({{"target_dist", 2.5}, {"gimbal_yaw", yaw}});
+mon.pushImageRGBA(rgba_ptr, w, h);   // 相机画面
+mon.commit();                        // 统一打帧号写入 Rerun + 刷新心跳
 
-// 或批量推送
-vision::Monitor::getInstance().pushData({
-    {"target_dist", 2.5},
-    {"gimbal_yaw", yaw_angle}
-});
+// 低频：
+mon.updateMap(esdf, 100, 100);       // ESDF 地图（立即写入）
 
-// 帧结束时提交
-vision::Monitor::getInstance().commit();
+// 读取面板下发的参数：
+float p, i, d; uint32_t exposure; bool fire;
+mon.syncParams(p, i, d, exposure, fire);
+
+// 进程退出前（重要，见下）：
+mon.shutdown();
 ```
 
-读取调参参数：
-```cpp
-float p, i, d;
-uint32_t exposure;
-bool fire_enabled;
-vision::Monitor::getInstance().syncParams(p, i, d, exposure, fire_enabled);
-```
+### 数据完整性注意事项（实测踩坑）
 
-## 5. WebSocket 消息约定
+1. **退出前必须调 `shutdown()`（或干净退出让它被调到）**。Rerun 的批处理器在大图像
+   流量下只有图像会因 1MiB 大小阈值持续落盘；标量等小 chunk 依赖的定时 flush 会被
+   饿死。`Monitor::commit()` 内置每 1s 一次显式 flush 兜底（异常被杀最多丢 ~1s），
+   但录制尾部数据仍需干净退出来 flush。demo（`src_cpp/main.cpp`）已带 SIGINT/SIGTERM
+   处理示例。
+2. **不要依赖静态析构去 flush**。Arrow 的全局内存池可能先于单例析构，会触发
+   `cannot create default memory pool` 崩溃——所以 `Monitor` 是故意泄漏的单例，
+   `shutdown()` 必须在 `main` 返回前显式调用。
 
-前端自动连接 `ws://<当前页面地址>/ws`（开发时由 Vite 代理到 `:5000`）。
+## 4. 控制面 HTTP API（:5000）
 
-### JSON 消息（TextMessage）
+| 接口 | 方法 | 说明 |
+|---|---|---|
+| `/health` | GET | `{status, shm_attached, version}` |
+| `/api/params` | GET | 当前参数（SHM 实时值） |
+| `/api/control` | POST | 写参数，body 任意字段可省：`{"pid_p":1.2,"pid_i":0.05,"pid_d":0.1,"exposure":5000,"fire_enabled":true}`；返回 clamp 后的生效值 |
+| `/api/status` | GET | producer 心跳年龄/存活、CPU 负载、温度 |
+| `/api/process/kill` | POST | SIGTERM 目标进程，默认 `{"name":"vision_producer"}` |
 
-| 类型 | 方向 | 频率 | 说明 |
-|------|------|------|------|
-| `metadata` | 后端→前端 | 连接时 + 动态更新 | 可用数据序列列表 |
-| `data` | 后端→前端 | 25Hz | 时序数据（`series` key-value） |
-| `map` | 后端→前端 | 5Hz | ESDF 栅格数据（100x100） |
-| `status` | 后端→前端 | 1Hz | 后端/SHM 状态、CPU 负载、温度 |
+参数范围（后端 clamp）：P ∈ [0,10]，I ∈ [0,1]，D ∈ [0,1]，exposure ∈ [100,50000]。
 
-### 二进制帧（BinaryMessage）— 视频
+## 5. SHM 控制块（v3）
 
-后端以 10Hz 推送 JPEG 编码的视频帧，二进制格式如下：
+`/dev/shm/aurora_rm_ctrl`，4KB 单页，布局见 `include/shm_layout.hpp`：
 
-```
-Offset  Size  Field
-0       4     Magic: 0x56494400 ("VID\0", little-endian)
-4       8     Timestamp (uint64, little-endian, 毫秒)
-12      2     Width (uint16, little-endian)
-14      2     Height (uint16, little-endian)
-16      N     JPEG 图像数据
-```
+- producer 写 `heartbeat_ms`（每次 commit），backend 读 → 存活检测；
+- backend 写参数字段，producer 每帧 `syncParams` 读；
+- 单字段自然对齐写入，不保证跨字段一致性（调参场景可容忍）；
+- producer 首次启动初始化默认参数；magic/version 有效时不重置——**参数跨重启保留**。
 
-前端通过 `ws.binaryType = 'arraybuffer'` 接收，解析 header 后创建 Blob URL 显示。
-
-### 前端写回参数
-
-发送 JSON 到同一个 WS 连接：
-```json
-{
-  "pid_p": 1.2,
-  "pid_i": 0.05,
-  "pid_d": 0.1,
-  "exposure": 5000,
-  "fire_enabled": true
-}
-```
-
-## 6. HTTP 接口
-
-- `GET /health`: 后端健康状态
-- `POST /api/control`: 控制参数写回（与 WS 写回字段一致）
-- `GET /api/video/latest`: 获取最新视频帧（JPEG，调试用途）
-- `POST /api/process/kill`: 终止目标进程（默认 `vision_producer`）
-
-## 7. 性能特性
-
-- **rAF 批量刷新**: 前端使用 `requestAnimationFrame` 合并多条 WS 数据消息，每渲染帧只触发一次 state 更新，大幅降低 GC 压力
-- **JPEG 视频推送**: 相比 PNG，JPEG 编码速度提升 5-10x，带宽降低 10-15x
-- **组件记忆化**: 图表组件（`DynamicChart`）和数据列表项（`SeriesItem`）使用 `React.memo` 避免不必要的重渲染
-- **压力测试**: 通过 `PULSESCOPE_STRESS_SERIES=512` 可模拟高通道数工况
+v2 时代的 10MB 数据 SHM（图像/JSON/地图 + seqlock）已整体退役，由 Rerun 取代。
