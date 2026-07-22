@@ -6,14 +6,14 @@
 ```
                     ┌─ Rerun SDK ──→ Rerun Viewer（时序曲线 / 相机画面 / ESDF 地图 / .rrd 录制回放）
 C++ Producer ───────┤
-                    └─ POSIX SHM（4KB 控制块）──→ Go Backend（:5000）──→ React 控制面板（:3000）
+                    └─ POSIX SHM（8KB 控制块）──→ Go Backend（:5000）──→ React 控制面板（:3000）
                           ↑                            │
                           └──── 参数写回（HTTP POST）────┘
 ```
 
 - **观测面（Rerun）**：producer 通过 Rerun C++ SDK 直接把时序数据、视频帧、ESDF 地图
   记录到 Rerun Viewer，支持时间轴回溯和 `.rrd` 文件录制/离线回放。
-- **控制面（自建）**：Rerun 是单向的（SDK → viewer），反向调参走 4KB 共享内存控制块，
+- **控制面（自建）**：Rerun 是单向的（SDK → viewer），反向调参走 8KB 共享内存控制块，
   Go 后端提供 HTTP API，前端是一个纯调参 + 运维面板（含进程 kill、心跳监控）。
 
 ## 1. 依赖
@@ -82,7 +82,7 @@ while (running) {
 
     const float p = gain.getFloat();          // 读面板下发的参数，句柄直读
 
-    mon.pushData("ekf_x", state.x);           // 时序标量
+    mon.pushData("ekf_x", state.x);           // 时序标量 → 实体路径 telemetry/ekf_x
     mon.pushImageRGBA(rgba, w, h, "world/gimbal/camera/image");
 
     // 识别结果作为结构化标注，不要烧进像素
@@ -99,6 +99,10 @@ mon.shutdown();                               // 进程退出前必须调用（�
 **实体路径是一棵变换树**：挂在 `world/gimbal` 上的位姿会被其下的 camera 及 2D 标注继承，
 自瞄的 相机系→云台系→世界系 就是这样表达的。每帧数据带三条时间轴
 （`frame` / `runtime` / `capture_time`），最后一条用于跨数据源对齐。
+
+**注意 `pushData` 是例外**：它的第一个参数是 key 而非完整实体路径，实际会被记录到
+`telemetry/<key>`。所以在 Viewer 里找标量曲线要展开 `telemetry/` 子树，其余 `push*`
+的第一个参数才是照原样使用的实体路径。
 
 本类未封装的 archetype（`Mesh3D`、`Tensor` 等）通过 `mon.stream()` 直接访问底层 Rerun。
 
@@ -137,7 +141,8 @@ mon.shutdown();                               // 进程退出前必须调用（�
 - 单字段原子，不保证跨参数同批生效（调参场景可容忍）；
 - producer 重启时同名同类型参数**沿用上次调过的值**，越界则钳制到新范围。
 
-设计与取舍详见 [控制面参数设计](docs/2026-07-22-self-describing-control-params.md)。
+设计与取舍详见 [控制面参数设计](docs/2026-07-22-self-describing-control-params.md)，
+观测面的对应记录见 [观测面 API 扩展](docs/2026-07-22-observability-api.md)。
 
 不带 backend 也能查看/修改参数：
 

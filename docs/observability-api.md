@@ -41,7 +41,7 @@ mon.init();                              // 只需一次
 while (running) {
     mon.beginFrame();                    // 帧边界（可选，见 §3）
 
-    mon.pushData("ekf_x", state.x);      // 时序标量
+    mon.pushData("ekf_x", state.x);      // 时序标量 → 实体路径 telemetry/ekf_x
     mon.pushImageRGBA(rgba, w, h, "camera/image");
 
     mon.commit();                        // 刷新心跳 + 周期性 flush
@@ -115,13 +115,16 @@ mon.beginFrame(exposure_timestamp_secs);
 
 ## 4. API 速查
 
-所有 `push*` 的第一个参数都是实体路径。`Annotations` 可省略。
+除 `pushData` 外，所有 `push*` 的第一个参数都是实体路径。`Annotations` 可省略。
+
+> `pushData` 的第一个参数是 **key**，实际记录到 `telemetry/<key>`——在 Viewer 里
+> 找标量曲线要展开 `telemetry/` 子树。
 
 ### 时序与图像
 
 ```cpp
-mon.pushData("ekf_x", 1.5);                          // 单个标量
-mon.pushData({{"ekf_x", 1.5}, {"ekf_y", 2.5}});      // 批量
+mon.pushData("ekf_x", 1.5);                          // 单个标量 → telemetry/ekf_x
+mon.pushData({{"ekf_x", 1.5}, {"ekf_y", 2.5}});      // 批量   → telemetry/ekf_y 等
 mon.pushImageRGBA(rgba, w, h, "camera/image");       // RGBA 图像，多路用不同路径
 mon.pushGrid(esdf, w, h, "esdf/map");                // 单通道 float 栅格（Turbo 伪彩）
 ```
