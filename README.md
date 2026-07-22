@@ -64,30 +64,43 @@ npm install && npm run dev     # http://localhost:3000
 
 ## 3. C++ 接口（业务代码接入）
 
-接口与 SHM 时代保持不变，业务代码无需改动：
+完整用法见 **[观测面 API 指南](docs/observability-api.md)**，这里只列骨架：
 
 ```cpp
 #include "vision_monitor.hpp"
 
 auto& mon = vision::Monitor::getInstance();
-mon.init();                          // 初始化 Rerun sink + 控制 SHM（只需一次）
+mon.init();                                   // Rerun sink + 控制 SHM，只需一次
 
-// 每帧：
-mon.pushData("ekf_x", ekf_state.x);  // 任意 key-value 时序数据
-mon.pushData({{"target_dist", 2.5}, {"gimbal_yaw", yaw}});
-mon.pushImageRGBA(rgba_ptr, w, h);   // 相机画面
-mon.commit();                        // 统一打帧号写入 Rerun + 刷新心跳
+// 声明可在线调节的参数（范围/步进/单位只在这里写一次，
+// backend 与前端自动生成控件，两端都不含硬编码）
+auto gain = mon.declareFloat("pid_p", 1.0, 0.0, 10.0, 0.01);
+auto exp  = mon.declareInt("exposure_time", 5000, 100, 50000, 100, "us");
 
-// 低频：
-mon.updateMap(esdf, 100, 100);       // ESDF 地图（立即写入）
+while (running) {
+    mon.beginFrame(exposure_timestamp);       // 传入采集时刻以便与 IMU/串口对齐
 
-// 读取面板下发的参数：
-float p, i, d; uint32_t exposure; bool fire;
-mon.syncParams(p, i, d, exposure, fire);
+    const float p = gain.getFloat();          // 读面板下发的参数，句柄直读
 
-// 进程退出前（重要，见下）：
-mon.shutdown();
+    mon.pushData("ekf_x", state.x);           // 时序标量
+    mon.pushImageRGBA(rgba, w, h, "world/gimbal/camera/image");
+
+    // 识别结果作为结构化标注，不要烧进像素
+    mon.pushBoxes2D("world/gimbal/camera/armors", {{cx, cy, bw, bh}}, ann);
+    mon.pushPoints3D("world/target", {{x, y, z}});
+    mon.setTransform("world/gimbal", translation, quaternion);
+
+    mon.commit();
+}
+
+mon.shutdown();                               // 进程退出前必须调用（见下）
 ```
+
+**实体路径是一棵变换树**：挂在 `world/gimbal` 上的位姿会被其下的 camera 及 2D 标注继承，
+自瞄的 相机系→云台系→世界系 就是这样表达的。每帧数据带三条时间轴
+（`frame` / `runtime` / `capture_time`），最后一条用于跨数据源对齐。
+
+本类未封装的 archetype（`Mesh3D`、`Tensor` 等）通过 `mon.stream()` 直接访问底层 Rerun。
 
 ### 数据完整性注意事项（实测踩坑）
 
@@ -105,20 +118,32 @@ mon.shutdown();
 | 接口 | 方法 | 说明 |
 |---|---|---|
 | `/health` | GET | `{status, shm_attached, version}` |
-| `/api/params` | GET | 当前参数（SHM 实时值） |
-| `/api/control` | POST | 写参数，body 任意字段可省：`{"pid_p":1.2,"pid_i":0.05,"pid_d":0.1,"exposure":5000,"fire_enabled":true}`；返回 clamp 后的生效值 |
-| `/api/status` | GET | producer 心跳年龄/存活、CPU 负载、温度 |
+| `/api/params` | GET | 参数表**含元数据**：`{version, count, params:[{key,type,value,min,max,step,unit,default}]}` |
+| `/api/control` | POST | 扁平映射 `{"pid_p":1.2,"fire_enabled":false}`；返回回读的生效值与被拒条目 `rejected[]` |
+| `/api/status` | GET | 心跳年龄/存活、`param_count`、CPU 负载、温度 |
 | `/api/process/kill` | POST | SIGTERM 目标进程，默认 `{"name":"vision_producer"}` |
 
-参数范围（后端 clamp）：P ∈ [0,10]，I ∈ [0,1]，D ∈ [0,1]，exposure ∈ [100,50000]。
+**合法范围不在 backend 也不在前端**——由 producer 在共享内存中声明，两端读表执行。
+新增参数只需在 producer 加一行 `declare`，无需改动 backend 或前端。
 
-## 5. SHM 控制块（v3）
+## 5. SHM 控制块（v4）
 
-`/dev/shm/aurora_rm_ctrl`，4KB 单页，布局见 `include/shm_layout.hpp`：
+`/dev/shm/aurora_rm_ctrl`，8KB，自描述槽位表，布局见 `include/shm_layout.hpp`：
 
+- 64 个 `ParamSlot`，每个自带 key/type/min/max/step/unit/default；
 - producer 写 `heartbeat_ms`（每次 commit），backend 读 → 存活检测；
-- backend 写参数字段，producer 每帧 `syncParams` 读；
-- 单字段自然对齐写入，不保证跨字段一致性（调参场景可容忍）；
-- producer 首次启动初始化默认参数；magic/version 有效时不重置——**参数跨重启保留**。
+- 运行期只有 `ParamSlot::value` 可变（backend 写、producer 读），8 字节对齐无锁；
+- `param_count` 是发布屏障：读到的计数以内，槽位元数据必然已完整写入；
+- 单字段原子，不保证跨参数同批生效（调参场景可容忍）；
+- producer 重启时同名同类型参数**沿用上次调过的值**，越界则钳制到新范围。
+
+设计与取舍详见 [控制面参数设计](docs/2026-07-22-self-describing-control-params.md)。
+
+不带 backend 也能查看/修改参数：
+
+```bash
+./build/shm_ctl dump              # 打印完整参数表
+./build/shm_ctl set pid_p 3.5     # 按 producer 声明的范围钳制后写入
+```
 
 v2 时代的 10MB 数据 SHM（图像/JSON/地图 + seqlock）已整体退役，由 Rerun 取代。
