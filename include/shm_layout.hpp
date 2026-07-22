@@ -6,37 +6,27 @@
 
 namespace vision {
 
+// v3: SHM 只承载控制面（反向调参 + 生产者心跳）。
+// 观测面数据（时序/图像/地图）已迁移到 Rerun SDK，不再经过共享内存。
 constexpr uint64_t kShmMagicNumber = 0x564953494F4E3031ULL; // "VISION01"
-constexpr uint64_t kShmVersion = 2;
-constexpr size_t kEsdfWidth = 100;
-constexpr size_t kEsdfHeight = 100;
-constexpr size_t kEsdfCells = kEsdfWidth * kEsdfHeight;
-constexpr size_t kDefaultShmSize = 10 * 1024 * 1024; // 10MB
-constexpr size_t kMaxJsonBytes = 64 * 1024;
+constexpr uint64_t kShmVersion = 3;
+constexpr const char* kControlShmName = "/aurora_rm_ctrl";
+constexpr size_t kControlShmSize = 4096; // 一页即可
 
 // 确保二进制对齐 (64-bit)
 #pragma pack(push, 8)
 
-struct ShmHeader {
+// 双向字段各自独立更新：
+//   producer 写 heartbeat_ms，backend 读；
+//   backend 写参数区，producer 读。
+// 每个字段本身按自然对齐写入，跨字段的一致性（例如 P/I/D 同批生效）
+// 不做保证——与 v2 的参数区语义一致，调参场景可以容忍。
+struct ShmControlBlock {
     uint64_t magic_number;  // kShmMagicNumber
-    uint64_t version;
-    uint64_t sequence;      // 偶数=稳定，奇数=写入中
-    uint64_t timestamp_ms;
-    
-    // 图像数据偏移量与大小
-    uint64_t img_offset;
-    uint64_t img_size;
-    uint32_t width;
-    uint32_t height;
+    uint64_t version;       // kShmVersion
+    uint64_t heartbeat_ms;  // producer 每次 commit 刷新（wall-clock 毫秒）
 
-    // 状态数据偏移量与大小 (JSON)
-    uint64_t json_offset;
-    uint64_t json_size;
-
-    // 地图数据 (ESDF slice: 100x100 grid)
-    float esdf_map[kEsdfCells];
-    
-    // 动态参数区 (用于反向调参)
+    // 动态参数区 (backend → producer)
     float pid_p;
     float pid_i;
     float pid_d;
@@ -48,7 +38,7 @@ struct ShmHeader {
 #pragma pack(pop)
 
 static_assert(sizeof(float) == 4, "float must be 4 bytes");
-static_assert(std::is_standard_layout<ShmHeader>::value, "ShmHeader must be standard-layout");
-static_assert(offsetof(ShmHeader, esdf_map) % alignof(float) == 0, "esdf_map must be aligned");
+static_assert(std::is_standard_layout<ShmControlBlock>::value, "ShmControlBlock must be standard-layout");
+static_assert(sizeof(ShmControlBlock) <= kControlShmSize, "control block must fit in one page");
 
 } // namespace vision

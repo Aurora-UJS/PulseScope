@@ -2,14 +2,28 @@
 #include "../include/vision_monitor.hpp"
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
+
+constexpr size_t kEsdfWidth = 100;
+constexpr size_t kEsdfHeight = 100;
+constexpr size_t kEsdfCells = kEsdfWidth * kEsdfHeight;
+
+// SIGINT/SIGTERM 时干净退出：让 RecordingStream 析构 flush 批处理器中
+// 尚未落盘的小 chunk（标量等），否则录制尾部数据会丢。
+volatile std::sig_atomic_t g_stop = 0;
+
+void onStopSignal(int) {
+    g_stop = 1;
+}
 
 int readEnvInt(const char* key, int fallback, int min_v, int max_v) {
     const char* raw = std::getenv(key);
@@ -26,14 +40,19 @@ int readEnvInt(const char* key, int fallback, int min_v, int max_v) {
 } // namespace
 
 int main() {
+    std::signal(SIGINT, onStopSignal);
+    std::signal(SIGTERM, onStopSignal);
+
     auto& monitor = vision::Monitor::getInstance();
-    
+
     if (!monitor.init()) {
-        std::cerr << "Failed to init SHM!" << std::endl;
+        std::cerr << "Failed to init monitor (rerun sink / control shm)!" << std::endl;
         return -1;
     }
 
-    std::cout << "C++ Producer started. Writing to /dev/shm/vision_debug_shm..." << std::endl;
+    std::cout << "C++ Producer started." << std::endl;
+    std::cout << "  Data plane   : Rerun (PULSESCOPE_RERUN_CONNECT / PULSESCOPE_RERUN_SAVE, default: spawn viewer)" << std::endl;
+    std::cout << "  Control plane: /dev/shm" << vision::kControlShmName << std::endl;
     std::cout << "Env options: PULSESCOPE_UPDATE_HZ, PULSESCOPE_MAP_HZ, PULSESCOPE_STRESS_SERIES, PULSESCOPE_NOISE_LEVEL" << std::endl;
 
     const int update_hz = readEnvInt("PULSESCOPE_UPDATE_HZ", 50, 1, 240);
@@ -43,7 +62,7 @@ int main() {
     const int video_width = 320;
     const int video_height = 240;
 
-    std::vector<float> esdf_map(vision::kEsdfCells, 0.0f);
+    std::vector<float> esdf_map(kEsdfCells, 0.0f);
     std::vector<uint8_t> video_rgba(video_width * video_height * 4, 0);
     std::vector<std::string> stress_keys;
     stress_keys.reserve(stress_series);
@@ -59,16 +78,20 @@ int main() {
     const auto map_period = std::chrono::microseconds(1000000 / map_hz);
     uint64_t frame_id = 0;
 
-    while (true) {
+    float last_p = -1.0f, last_i = -1.0f, last_d = -1.0f;
+    uint32_t last_exposure = 0;
+    bool last_fire = false;
+
+    while (!g_stop) {
         next_frame += frame_period;
         const auto now = std::chrono::steady_clock::now();
         const float t = std::chrono::duration<float>(now - start).count();
 
         // 1. 模拟 ESDF 地图数据更新（较低频）
         if (now >= next_map) {
-            for (size_t idx = 0; idx < vision::kEsdfCells; ++idx) {
-                const int x = static_cast<int>(idx % vision::kEsdfWidth);
-                const int y = static_cast<int>(idx / vision::kEsdfWidth);
+            for (size_t idx = 0; idx < kEsdfCells; ++idx) {
+                const int x = static_cast<int>(idx % kEsdfWidth);
+                const int y = static_cast<int>(idx / kEsdfWidth);
 
                 const float ox1 = 50.0f + std::sin(t * 0.9f) * 18.0f;
                 const float oy1 = 45.0f + std::cos(t * 0.8f) * 14.0f;
@@ -84,17 +107,24 @@ int main() {
                 esdf_map[idx] = std::clamp(std::min(d1, d2) + wave, 0.0f, 4.0f);
             }
 
-            monitor.updateMap(esdf_map.data(), esdf_map.size());
+            monitor.updateMap(esdf_map.data(), kEsdfWidth, kEsdfHeight);
             while (next_map <= now) {
                 next_map += map_period;
             }
         }
 
-        // 2. 模拟参数同步 (从前端读)
+        // 2. 参数同步（backend 通过 SHM 写入）
         float p = 0.0f, i = 0.0f, d = 0.0f;
         uint32_t exposure = 0;
         bool fire_enabled = false;
         monitor.syncParams(p, i, d, exposure, fire_enabled);
+        if (p != last_p || i != last_i || d != last_d || exposure != last_exposure || fire_enabled != last_fire) {
+            std::printf("[params] P=%.3f I=%.3f D=%.3f exposure=%u fire=%d\n",
+                        p, i, d, exposure, fire_enabled ? 1 : 0);
+            std::fflush(stdout);
+            last_p = p; last_i = i; last_d = d;
+            last_exposure = exposure; last_fire = fire_enabled;
+        }
 
         // 3. 写入监控数据（核心+压力通道）
         const double dt = std::chrono::duration<double>(now - last_frame).count();
@@ -182,5 +212,7 @@ int main() {
         std::this_thread::sleep_until(next_frame);
     }
 
+    std::cout << "Shutting down, flushing rerun buffers..." << std::endl;
+    monitor.shutdown();
     return 0;
 }

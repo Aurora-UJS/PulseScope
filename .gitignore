@@ -7,3 +7,9 @@ vision_producer
 backend/vision-backend
 *.o
 *.out
+
+# cmake build tree (含 FetchContent 拉取的 rerun sdk)
+build/
+
+# rerun 录制文件
+*.rrd
