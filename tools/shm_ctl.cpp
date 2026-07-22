@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +149,9 @@ int doSet(const char* name, const char* key, const char* raw_value) {
 
         // 与 backend 同样的规则：钳制到 producer 声明的区间，整数/布尔取整
         double v = value;
+        // strtod 接受 "nan"，而 NaN 与任何数比较都为 false，会静默穿过下面的
+        // 区间钳制直接落进控制环，必须先挡掉——与 backend clampToSlot 同语义。
+        if (std::isnan(v)) v = s.default_value;
         if (v < s.min_value) v = s.min_value;
         if (v > s.max_value) v = s.max_value;
         if (s.type == vision::kParamInt)  v = static_cast<double>(static_cast<int64_t>(v < 0 ? v - 0.5 : v + 0.5));
