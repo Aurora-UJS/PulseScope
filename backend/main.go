@@ -10,11 +10,13 @@ package main
 // SHM 布局必须与 C++ 端 include/shm_layout.hpp 的 ShmControlBlock 严格对齐。
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -29,41 +32,80 @@ import (
 
 const (
 	shmPath         = "/dev/shm/aurora_rm_ctrl"
-	shmSize         = 4096
+	shmSize         = 8192
 	expectedMagic   = 0x564953494F4E3031 // "VISION01"
-	expectedVersion = 3
+	expectedVersion = 4
+
+	maxParams   = 64
+	paramKeyLen = 32
+	paramUnitLn = 16
+
+	// 槽位类型，与 C++ 端 vision::ParamType 一致
+	paramTypeFloat = 1
+	paramTypeInt   = 2
+	paramTypeBool  = 3
 
 	// producer 每帧 commit 刷新心跳（默认 50Hz），2s 无更新视为离线
 	heartbeatTimeout = 2 * time.Second
 )
 
-// ShmControlBlock 与 C++ 端 shm_layout.hpp 逐字段对齐（pack(8)，自然对齐无补齐）。
-type ShmControlBlock struct {
-	MagicNumber  uint64
-	Version      uint64
-	HeartbeatMs  uint64
-	PidP         float32
-	PidI         float32
-	PidD         float32
-	ExposureTime uint32
-	IsFireEnable uint8
-	Reserved     [3]byte
+// ParamSlot / ShmControlBlock 与 C++ 端 include/shm_layout.hpp 逐字节对齐。
+// Go 不重排结构体字段，按声明顺序自然对齐即可匹配 C++ 的 pack(8) 布局；
+// Reserved 字段是显式补齐，不能省略——它让 Value 落在 8 字节边界上。
+//
+// 两侧的偏移量由各自的检查锁定：C++ 是 shm_layout.hpp 里的 static_assert，
+// Go 是 TestLayoutContract。任一侧改动布局，另一侧立即失败。
+type ParamSlot struct {
+	Key      [paramKeyLen]byte
+	Unit     [paramUnitLn]byte
+	Type     uint8
+	Reserved [7]byte
+	Value    float64
+	MinValue float64
+	MaxValue float64
+	Step     float64
+	Default  float64
 }
 
-type ControlUpdate struct {
-	PidP        *float32 `json:"pid_p"`
-	PidI        *float32 `json:"pid_i"`
-	PidD        *float32 `json:"pid_d"`
-	Exposure    *float32 `json:"exposure"`
-	FireEnabled *bool    `json:"fire_enabled"`
+type ShmControlBlock struct {
+	MagicNumber uint64
+	Version     uint64
+	HeartbeatMs uint64
+	ParamCount  uint32
+	Reserved0   uint32
+	Reserved1   [4]uint64
+	Params      [maxParams]ParamSlot
+}
+
+// ParamInfo 是单个参数对外的完整描述。前端据此渲染控件并校验输入，
+// 不再硬编码任何参数名或范围——真值来源是 producer 的 declare。
+type ParamInfo struct {
+	Key     string  `json:"key"`
+	Type    string  `json:"type"` // float | int | bool
+	Value   float64 `json:"value"`
+	Min     float64 `json:"min"`
+	Max     float64 `json:"max"`
+	Step    float64 `json:"step"`
+	Unit    string  `json:"unit"`
+	Default float64 `json:"default"`
 }
 
 type ParamsResponse struct {
-	PidP        float32 `json:"pid_p"`
-	PidI        float32 `json:"pid_i"`
-	PidD        float32 `json:"pid_d"`
-	Exposure    uint32  `json:"exposure"`
-	FireEnabled bool    `json:"fire_enabled"`
+	Version uint64      `json:"version"`
+	Count   int         `json:"count"`
+	Params  []ParamInfo `json:"params"`
+}
+
+// ControlUpdate 是 key -> 新值的扁平映射，例如
+// {"pid_p": 3.5, "fire_enabled": false}。
+// 数值用 JSON number，布尔用 JSON bool，其余类型拒绝。
+type ControlUpdate map[string]interface{}
+
+// ControlResponse 在回读的参数表之外附带被拒绝的条目，
+// 让前端能区分「值被钳制」与「key 根本不存在」。
+type ControlResponse struct {
+	ParamsResponse
+	Rejected []string `json:"rejected"`
 }
 
 type StatusResponse struct {
@@ -72,6 +114,7 @@ type StatusResponse struct {
 	ShmValid       bool    `json:"shm_valid"`
 	ProducerAlive  bool    `json:"producer_alive"`
 	HeartbeatAgeMs int64   `json:"heartbeat_age_ms"` // -1 表示未知
+	ParamCount     int     `json:"param_count"`      // 变化说明 producer 换了参数集，前端据此重拉
 	NucCpuLoad     float64 `json:"nuc_cpu_load"`
 	NucTemp        float64 `json:"nuc_temp"`
 }
@@ -116,9 +159,12 @@ func (s *ShmRuntime) attachLocked() error {
 		_ = f.Close()
 		return err
 	}
-	if info.Size() < int64(unsafe.Sizeof(ShmControlBlock{})) {
+	// 必须按 mmap 长度校验，而不是结构体大小：映射超出文件末尾的部分，
+	// 访问时会触发 SIGBUS 而非返回错误。v3 producer 建的是 4096 字节，
+	// 在这里被挡下，不会进入按 v4 布局解析的路径。
+	if info.Size() < int64(shmSize) {
 		_ = f.Close()
-		return fmt.Errorf("shm too small (%d bytes), stale producer?", info.Size())
+		return fmt.Errorf("shm too small (%d bytes, need %d), stale v3 producer?", info.Size(), shmSize)
 	}
 
 	data, err := syscall.Mmap(int(f.Fd()), 0, shmSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
@@ -172,7 +218,46 @@ func (s *ShmRuntime) Version() uint64 {
 func (s *ShmRuntime) Valid() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ctrl != nil && s.ctrl.MagicNumber == expectedMagic && s.ctrl.Version == expectedVersion
+	return s.validLocked()
+}
+
+// validLocked 判定控制块可解析：已挂载 + magic/version 匹配 + 计数合法。
+//
+// 所有触碰槽位的路径都必须先过这一关。v3 的 pid_p 恰好落在 v4 的 param_count
+// 位置上：跳过校验去读会得到垃圾值，去写则直接破坏参数表计数——
+// 这是 v3 版本 ReadParams/ApplyControl 的真实缺陷，此处一并堵死。
+func (s *ShmRuntime) validLocked() bool {
+	if s.ctrl == nil {
+		return false
+	}
+	if s.ctrl.MagicNumber != expectedMagic || s.ctrl.Version != expectedVersion {
+		return false
+	}
+	return s.paramCountLocked() <= maxParams
+}
+
+// paramCountLocked 以 acquire 语义读取计数，与 C++ 端 declare() 里的
+// release fence 配对：读到的 count 以内，槽位元数据必然已完整写入。
+func (s *ShmRuntime) paramCountLocked() uint32 {
+	return atomic.LoadUint32(&s.ctrl.ParamCount)
+}
+
+func (s *ShmRuntime) findSlotLocked(key string, count uint32) *ParamSlot {
+	for i := uint32(0); i < count; i++ {
+		if cString(s.ctrl.Params[i].Key[:]) == key {
+			return &s.ctrl.Params[i]
+		}
+	}
+	return nil
+}
+
+func (s *ShmRuntime) ParamCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.validLocked() {
+		return 0
+	}
+	return int(s.paramCountLocked())
 }
 
 // HeartbeatAgeMs 返回距 producer 上次 commit 的毫秒数，未知返回 -1。
@@ -189,61 +274,151 @@ func (s *ShmRuntime) HeartbeatAgeMs() int64 {
 	return age
 }
 
+// ReadParams 读出 producer 声明的完整参数表（含元数据）。
+// backend 不知道也不需要知道参数的名字与含义，只做搬运。
 func (s *ShmRuntime) ReadParams() (ParamsResponse, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ctrl == nil {
+	if !s.validLocked() {
 		return ParamsResponse{}, false
 	}
-	return ParamsResponse{
-		PidP:        s.ctrl.PidP,
-		PidI:        s.ctrl.PidI,
-		PidD:        s.ctrl.PidD,
-		Exposure:    s.ctrl.ExposureTime,
-		FireEnabled: s.ctrl.IsFireEnable != 0,
-	}, true
+
+	count := s.paramCountLocked()
+	resp := ParamsResponse{
+		Version: s.ctrl.Version,
+		Params:  make([]ParamInfo, 0, count),
+	}
+	for i := uint32(0); i < count; i++ {
+		slot := &s.ctrl.Params[i]
+		key := cString(slot.Key[:])
+		if key == "" {
+			continue // key 无 NUL 结尾或为空：脏槽位，跳过而不是当作有效参数
+		}
+		resp.Params = append(resp.Params, ParamInfo{
+			Key:     key,
+			Type:    typeName(slot.Type),
+			Value:   loadValue(slot),
+			Min:     slot.MinValue,
+			Max:     slot.MaxValue,
+			Step:    slot.Step,
+			Unit:    cString(slot.Unit[:]),
+			Default: slot.Default,
+		})
+	}
+	resp.Count = len(resp.Params)
+	return resp, true
 }
 
-// ApplyControl 将参数写入 SHM（逐字段独立写，与 C++ 端约定一致：
-// 单字段自然对齐写入，不保证跨字段一致性——调参场景可容忍）。
-func (s *ShmRuntime) ApplyControl(update ControlUpdate) bool {
+// ApplyControl 按 key 写入参数值。合法区间与类型来自共享内存中 producer 的
+// 声明，backend 不再持有任何硬编码范围。
+//
+// 逐个参数独立写入：单个槽位的 value 是 8 字节对齐的原子写，
+// 但跨参数不保证同批生效（例如 P/I/D 可能被 producer 分两帧读到）——
+// 与 v3 语义一致，调参场景可容忍。
+//
+// 返回被拒绝的条目描述；未知 key 或非法类型不会中断其余参数的写入。
+func (s *ShmRuntime) ApplyControl(update ControlUpdate) ([]string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ctrl == nil {
-		return false
+	if !s.validLocked() {
+		return nil, false
 	}
 
-	if update.PidP != nil {
-		s.ctrl.PidP = clamp(*update.PidP, 0.0, 10.0)
-	}
-	if update.PidI != nil {
-		s.ctrl.PidI = clamp(*update.PidI, 0.0, 1.0)
-	}
-	if update.PidD != nil {
-		s.ctrl.PidD = clamp(*update.PidD, 0.0, 1.0)
-	}
-	if update.Exposure != nil {
-		s.ctrl.ExposureTime = uint32(clamp(*update.Exposure, 100, 50000))
-	}
-	if update.FireEnabled != nil {
-		if *update.FireEnabled {
-			s.ctrl.IsFireEnable = 1
-		} else {
-			s.ctrl.IsFireEnable = 0
+	count := s.paramCountLocked()
+	rejected := make([]string, 0)
+
+	for key, raw := range update {
+		value, err := toFloat(raw)
+		if err != nil {
+			rejected = append(rejected, fmt.Sprintf("%s: %v", key, err))
+			continue
 		}
+		slot := s.findSlotLocked(key, count)
+		if slot == nil {
+			rejected = append(rejected, fmt.Sprintf("%s: no such param", key))
+			continue
+		}
+		storeValue(slot, clampToSlot(value, slot))
 	}
-	return true
+	return rejected, true
 }
 
-// clamp 将值钳制到 [min, max] 区间内，防止非法参数写入 SHM
-func clamp(v, min, max float32) float32 {
-	if v < min {
-		return min
+// cString 将定长 NUL 结尾字节数组转为 Go 字符串。
+// 缺少 NUL 视为脏数据，返回空串由调用方跳过——绝不把整个定长数组当字符串用。
+func cString(b []byte) string {
+	n := bytes.IndexByte(b, 0)
+	if n < 0 {
+		return ""
 	}
-	if v > max {
-		return max
+	return string(b[:n])
+}
+
+func typeName(t uint8) string {
+	switch t {
+	case paramTypeFloat:
+		return "float"
+	case paramTypeInt:
+		return "int"
+	case paramTypeBool:
+		return "bool"
+	default:
+		return "unknown"
+	}
+}
+
+// loadValue / storeValue 原子读写槽位值。
+//
+// C++ 端对同一位置做 volatile 读。两侧都依赖同一条硬件保证：8 字节对齐的
+// load/store 在 x86-64 与 ARM64 上不会撕裂。atomic 在此之上额外阻止
+// Go 编译器缓存或重排这次访问。
+func loadValue(s *ParamSlot) float64 {
+	return math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&s.Value))))
+}
+
+func storeValue(s *ParamSlot, v float64) {
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&s.Value)), math.Float64bits(v))
+}
+
+// clampToSlot 按 producer 声明的区间与类型规整待写入的值。
+// 取整规则必须与 C++ 端 ParamHandle::getInt()（std::llround，四舍五入）一致，
+// 否则前端显示值与 producer 实际使用值会出现偏差。
+func clampToSlot(v float64, s *ParamSlot) float64 {
+	// NaN 与任何数比较都为 false，会静默穿过下面的区间钳制，必须先挡掉
+	if math.IsNaN(v) {
+		return s.Default
+	}
+	if v < s.MinValue {
+		v = s.MinValue
+	}
+	if v > s.MaxValue {
+		v = s.MaxValue
+	}
+	switch s.Type {
+	case paramTypeInt:
+		v = math.Round(v)
+	case paramTypeBool:
+		if v != 0 {
+			v = 1
+		} else {
+			v = 0
+		}
 	}
 	return v
+}
+
+// toFloat 接受 JSON number 与 bool，其余类型（字符串/对象/数组/null）拒绝。
+func toFloat(raw interface{}) (float64, error) {
+	switch v := raw.(type) {
+	case float64:
+		return v, nil
+	case bool:
+		if v {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("unsupported value type %T", raw)
+	}
 }
 
 func killProcessesByName(name string) (int, error) {
@@ -388,14 +563,15 @@ func main() {
 			http.Error(w, "control shm not available (producer offline?)", http.StatusServiceUnavailable)
 			return
 		}
-		if !shm.ApplyControl(update) {
-			http.Error(w, "control shm not available", http.StatusServiceUnavailable)
+		rejected, ok := shm.ApplyControl(update)
+		if !ok {
+			http.Error(w, "control shm unavailable or version mismatch (expected v4)", http.StatusServiceUnavailable)
 			return
 		}
 
 		// 回读生效值（含 clamp 结果），前端据此对齐 UI
 		params, _ := shm.ReadParams()
-		writeJSON(w, params)
+		writeJSON(w, ControlResponse{ParamsResponse: params, Rejected: rejected})
 	})
 
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
@@ -412,6 +588,7 @@ func main() {
 			ShmValid:       shm.Valid(),
 			ProducerAlive:  age >= 0 && age < heartbeatTimeout.Milliseconds(),
 			HeartbeatAgeMs: age,
+			ParamCount:     shm.ParamCount(),
 			NucCpuLoad:     readCPULoadPct(),
 			NucTemp:        readCPUTempC(),
 		})
