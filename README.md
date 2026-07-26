@@ -52,7 +52,14 @@ Rerun sink 由环境变量选择（按优先级）：
 
 ```bash
 # 终端 2
-cd backend && go run main.go   # 监听 :5000，producer 未启动也能起（惰性挂载 SHM）
+cd backend && go run main.go   # 默认监听 127.0.0.1:5000，producer 未启动也能起（惰性挂载 SHM）
+```
+
+默认只绑回环——该端口无鉴权，却能改 `fire_enabled`、SIGTERM 任意进程，不应默认暴露
+在局域网上。需要从其他机器访问（远程面板）时显式放开：
+
+```bash
+PULSESCOPE_BIND=0.0.0.0:5000 go run main.go
 ```
 
 ### 步骤 C: 启动前端控制面板

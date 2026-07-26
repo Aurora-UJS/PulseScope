@@ -447,6 +447,12 @@ func main() {
 		})
 	})
 
-	fmt.Println("PulseScope control-plane backend running on :5000")
-	log.Fatal(http.ListenAndServe(":5000", nil))
+	// 默认只绑回环：这个端口无鉴权，却能改 fire_enabled、SIGTERM 任意进程，
+	// 不能默认暴露在赛场 LAN 上。远程部署显式设 PULSESCOPE_BIND=0.0.0.0:5000。
+	addr := os.Getenv("PULSESCOPE_BIND")
+	if addr == "" {
+		addr = "127.0.0.1:5000"
+	}
+	fmt.Println("PulseScope control-plane backend running on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
