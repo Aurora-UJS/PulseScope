@@ -16,6 +16,9 @@ C++ Producer ───────┤
 - **控制面（自建）**：Rerun 是单向的（SDK → viewer），反向调参走 4KB 共享内存控制块，
   Go 后端提供 HTTP API，前端是一个纯调参 + 运维面板（含进程 kill、心跳监控）。
 
+数据面是**统一入口**：任何生产者（本仓库 demo、aim-rs 回放/真机）按
+[TOPICS.md](TOPICS.md) 的 topic 契约发数据即可，viewer 用同一份 blueprint 呈现。
+
 ## 1. 依赖
 
 - **操作系统**: Linux（需要 `/dev/shm` 与 `/proc`）
