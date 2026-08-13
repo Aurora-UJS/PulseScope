@@ -41,4 +41,40 @@ static_assert(sizeof(float) == 4, "float must be 4 bytes");
 static_assert(std::is_standard_layout<ShmControlBlock>::value, "ShmControlBlock must be standard-layout");
 static_assert(sizeof(ShmControlBlock) <= kControlShmSize, "control block must fit in one page");
 
+// v4 观测面：web 面板实时观测通道（视频帧 + 标量快照）。
+//
+// 实时观测回归 web（backend 读本块转 MJPEG / 时序 JSON）；Rerun 保留为
+// 可选通道（显式设置 PULSESCOPE_RERUN_CONNECT / _SAVE 时才启用），
+// 默认不再 spawn viewer（占资源且实时卡顿）。
+//
+// 一致性协议（seqlock）：
+//   writer：sequence++（变奇）→ 写帧/JSON/header → sequence++（变偶）
+//   reader：读 sequence 为偶 → 读数据 → 重读 sequence 不变则有效
+// 控制面（ShmControlBlock）独立于本块，协议不变。
+constexpr uint64_t kObsShmVersion = 4;
+constexpr const char* kObsShmName = "/aurora_rm_obs";
+constexpr size_t kObsShmSize = 10 * 1024 * 1024; // 10MB：1080p RGBA + JSON 余量
+constexpr size_t kObsMaxJsonBytes = 64 * 1024;
+
+struct ObsShmHeader {
+    uint64_t magic_number;  // kShmMagicNumber
+    uint64_t version;       // kObsShmVersion
+    uint64_t sequence;      // 偶数=稳定，奇数=写入中
+    uint64_t timestamp_ms;
+    uint64_t frame_index;
+
+    // 图像数据区（RGBA8，width*height*4 字节）
+    uint64_t img_offset;
+    uint64_t img_size;
+    uint32_t width;
+    uint32_t height;
+
+    // 标量快照 JSON（{key: number}）
+    uint64_t json_offset;
+    uint64_t json_size;
+};
+
+static_assert(std::is_standard_layout<ObsShmHeader>::value, "ObsShmHeader must be standard-layout");
+static_assert(sizeof(ObsShmHeader) <= 256, "observation header must stay small");
+
 } // namespace vision

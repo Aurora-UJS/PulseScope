@@ -347,6 +347,62 @@ func main() {
 	}
 	defer shm.Close()
 
+	// 观测面：web 面板实时视频 + 时序曲线（Rerun 保持可选，实时观测不再依赖它）
+	obs := NewObsShm()
+	go func() {
+		for {
+			obs.poll()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	http.HandleFunc("/api/video", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+		w.Header().Set("Cache-Control", "no-store")
+		var lastSeq uint64
+		var lastAt time.Time
+		for {
+			seq, jpg, at := obs.latestJpeg()
+			if len(jpg) > 0 && seq != lastSeq && time.Since(lastAt) >= obsStreamMinGap {
+				lastSeq, lastAt = seq, at
+				if _, err := w.Write([]byte("--frame\r\nContent-Type: image/jpeg\r\n\r\n")); err != nil {
+					return
+				}
+				if _, err := w.Write(jpg); err != nil {
+					return
+				}
+				if _, err := w.Write([]byte("\r\n")); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	})
+
+	http.HandleFunc("/api/series", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		maxPoints := 300
+		if v, err := strconv.Atoi(r.URL.Query().Get("max_points")); err == nil {
+			if v < 10 {
+				v = 10
+			}
+			if v > obsHistoryMax {
+				v = obsHistoryMax
+			}
+			maxPoints = v
+		}
+		writeJSON(w, obs.seriesJSON(maxPoints))
+	})
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		_ = shm.EnsureAttached()
 		writeJSON(w, HealthResponse{
@@ -446,6 +502,14 @@ func main() {
 			KilledCount: killed,
 		})
 	})
+
+	// 生产部署：vite build 产物由 backend 单进程服务（与 awakening 的
+	// Flask 全包模式一致）。开发模式走 vite dev（proxy 到 :5000）。
+	if distDir := os.Getenv("PULSESCOPE_WEB_DIST"); distDir != "" {
+		if _, err := os.Stat(distDir); err == nil {
+			http.Handle("/", http.FileServer(http.Dir(distDir)))
+		}
+	}
 
 	// 默认只绑回环：这个端口无鉴权，却能改 fire_enabled、SIGTERM 任意进程，
 	// 不能默认暴露在赛场 LAN 上。远程部署显式设 PULSESCOPE_BIND=0.0.0.0:5000。

@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
@@ -21,13 +22,11 @@
 
 namespace vision {
 
-// 观测面走 Rerun（时序/图像/地图 → Rerun Viewer），
+// 观测面双通道：
+//   - 实时：观测 SHM（/aurora_rm_obs，v4）→ web 面板（backend 转 MJPEG/时序）
+//   - 可选：Rerun（显式设置 PULSESCOPE_RERUN_CONNECT / _SAVE 时启用；
+//     默认不再 spawn viewer——占资源且实时卡顿）
 // 控制面走 SHM（backend 写参数，producer 读；producer 写心跳）。
-//
-// Rerun sink 由环境变量选择（按优先级）：
-//   PULSESCOPE_RERUN_CONNECT=rerun+http://<host>:9876/proxy  连接已运行的 viewer
-//   PULSESCOPE_RERUN_SAVE=<path>.rrd                          录制到文件（可事后回放）
-//   （都未设置）                                               spawn 本机 viewer
 class Monitor {
 public:
     static Monitor& getInstance() {
@@ -40,8 +39,13 @@ public:
     }
 
     bool init(const char* app_id = "pulsescope",
-              const char* shm_name = kControlShmName) {
-        return initRerun(app_id) && initControlShm(shm_name);
+              const char* shm_name = kControlShmName,
+              const char* obs_shm_name = kObsShmName) {
+        // 观测块失败不致命：web 观测面板不可用，但 Rerun/控制面照常。
+        const bool rerun_ok = initRerun(app_id);
+        initObsShm(obs_shm_name);
+        const bool ctrl_ok = initControlShm(shm_name);
+        return rerun_ok && ctrl_ok;
     }
 
     // 在 main 返回前调用：flush 并关闭 Rerun 流、解除 SHM 映射。
@@ -51,6 +55,10 @@ public:
         if (ctrl) {
             munmap(ctrl, kControlShmSize);
             ctrl = nullptr;
+        }
+        if (obs) {
+            munmap(obs, kObsShmSize);
+            obs = nullptr;
         }
     }
 
@@ -126,6 +134,8 @@ public:
             ctrl->heartbeat_ms = now_ms;
         }
 
+        publishObs(now_ms);
+
         scalar_buffer.clear();
         frame_index++;
     }
@@ -154,7 +164,7 @@ public:
     }
 
 private:
-    Monitor() : ctrl(nullptr), image_width(0), image_height(0), frame_index(0), last_flush_ms(0) {}
+    Monitor() : ctrl(nullptr), obs(nullptr), image_width(0), image_height(0), frame_index(0), last_flush_ms(0) {}
     Monitor(const Monitor&) = delete;
     Monitor& operator=(const Monitor&) = delete;
 
@@ -170,7 +180,10 @@ private:
         } else if (save_path && *save_path) {
             err = rec->save(save_path);
         } else {
-            err = rec->spawn();
+            // 默认关闭实时 Rerun（spawn viewer 占资源且实时卡顿）；
+            // 实时观测走 web 面板，需要深度分析/回放时显式设上述环境变量。
+            rec.reset();
+            return true;
         }
 
         if (err.is_err()) {
@@ -179,6 +192,100 @@ private:
             return false;
         }
         return true;
+    }
+
+    bool initObsShm(const char* shm_name) {
+        int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+        if (fd == -1) {
+            std::cerr << "obs shm_open failed: " << strerror(errno) << std::endl;
+            return false;
+        }
+        if (ftruncate(fd, static_cast<off_t>(kObsShmSize)) == -1) {
+            std::cerr << "obs ftruncate failed: " << strerror(errno) << std::endl;
+            close(fd);
+            return false;
+        }
+        void* ptr = mmap(NULL, kObsShmSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (ptr == MAP_FAILED) {
+            std::cerr << "obs mmap failed: " << strerror(errno) << std::endl;
+            return false;
+        }
+        obs = static_cast<ObsShmHeader*>(ptr);
+        obs->magic_number = kShmMagicNumber;
+        obs->version = kObsShmVersion;
+        obs->sequence = 0;
+        obs->img_offset = 0;
+        obs->img_size = 0;
+        obs->width = 0;
+        obs->height = 0;
+        obs->json_offset = 0;
+        obs->json_size = 0;
+        return true;
+    }
+
+    // 把当前帧（图像 + 标量快照）写入观测 SHM（seqlock：奇=写，偶=稳）。
+    void publishObs(uint64_t now_ms) {
+        if (!obs) return;
+
+        // 构建 JSON 快照（与后端约定：{key: number}，无嵌套）
+        std::string json_str;
+        json_str.reserve(scalar_buffer.size() * 28 + 4);
+        json_str.push_back('{');
+        bool first = true;
+        for (const auto& [key, value] : scalar_buffer) {
+            if (!first) json_str.push_back(',');
+            json_str.push_back('"');
+            json_str += key;
+            json_str += "\":";
+            json_str += std::to_string(value);
+            first = false;
+        }
+        json_str.push_back('}');
+        if (json_str.size() > kObsMaxJsonBytes) {
+            json_str.resize(kObsMaxJsonBytes);
+        }
+
+        const size_t expected_size =
+            static_cast<size_t>(image_width) * static_cast<size_t>(image_height) * 4;
+        const bool have_image =
+            !image_buffer.empty() && image_buffer.size() == expected_size && expected_size > 0;
+
+        // begin write
+        obs->sequence = frame_index * 2 + 1;
+        __sync_synchronize();
+
+        char* base = reinterpret_cast<char*>(obs);
+        size_t cursor = sizeof(ObsShmHeader);
+        if (have_image && cursor + expected_size <= kObsShmSize) {
+            std::memcpy(base + cursor, image_buffer.data(), expected_size);
+            obs->img_offset = cursor;
+            obs->img_size = expected_size;
+            obs->width = image_width;
+            obs->height = image_height;
+            cursor += expected_size;
+        } else {
+            obs->img_offset = 0;
+            obs->img_size = 0;
+            obs->width = 0;
+            obs->height = 0;
+        }
+
+        size_t json_size = 0;
+        if (cursor < kObsShmSize) {
+            json_size = std::min(json_str.size(), kObsShmSize - cursor);
+            if (json_size > 0) {
+                std::memcpy(base + cursor, json_str.data(), json_size);
+            }
+        }
+        obs->json_offset = cursor;
+        obs->json_size = json_size;
+        obs->timestamp_ms = now_ms;
+        obs->frame_index = frame_index;
+
+        // end write
+        __sync_synchronize();
+        obs->sequence = frame_index * 2 + 2;
     }
 
     bool initControlShm(const char* shm_name) {
@@ -228,6 +335,7 @@ private:
 
     std::optional<rerun::RecordingStream> rec;
     ShmControlBlock* ctrl;
+    ObsShmHeader* obs;
     std::unordered_map<std::string, double> scalar_buffer;
     std::vector<uint8_t> image_buffer;
     uint32_t image_width;

@@ -1,20 +1,21 @@
 
 # PulseScope
 
-机器人视觉程序的观测 + 调参工具。**观测面走 [Rerun](https://rerun.io)，控制面自建**：
+机器人视觉程序的实时观测 + 调参工具。日常观测走 Web，Rerun 用于可选录制与深度分析：
 
 ```
-                    ┌─ Rerun SDK ──→ Rerun Viewer（时序曲线 / 相机画面 / ESDF 地图 / .rrd 录制回放）
+                    ┌─ POSIX SHM（10MB 观测块）─→ Go Backend ─→ Web（同步时序图 / 视频）
 C++ Producer ───────┤
-                    └─ POSIX SHM（4KB 控制块）──→ Go Backend（:5000）──→ React 控制面板（:3000）
-                          ↑                            │
-                          └──── 参数写回（HTTP POST）────┘
+                    ├─ POSIX SHM（4KB 控制块）──↔ Go Backend ─→ Web（调参 / 运维）
+                    └─ Rerun SDK（显式启用）────→ Viewer / .rrd 录制回放
 ```
 
-- **观测面（Rerun）**：producer 通过 Rerun C++ SDK 直接把时序数据、视频帧、ESDF 地图
-  记录到 Rerun Viewer，支持时间轴回溯和 `.rrd` 文件录制/离线回放。
-- **控制面（自建）**：Rerun 是单向的（SDK → viewer），反向调参走 4KB 共享内存控制块，
-  Go 后端提供 HTTP API，前端是一个纯调参 + 运维面板（含进程 kill、心跳监控）。
+- **实时观测面（Web）**：producer 把标量与 RGBA 帧写入 10MB seqlock 共享内存；后端
+  提供时序 JSON 与 MJPEG。前端使用递归分屏工作区，每个窗口可显示 Video 或 Plot，
+  支持左右/上下拆分、关闭、拖动比例和单窗全屏；Plot 支持信号搜索/少量叠加、自动
+  Y 轴、暂停、缩放/平移及复位。
+- **控制面（Web）**：反向调参走独立的 4KB 共享内存控制块，包含进程 kill 与心跳监控。
+- **深度分析（可选 Rerun）**：显式配置连接或保存路径后启用，用于地图、录制和离线回放。
 
 数据面是**统一入口**：任何生产者（本仓库 demo、aim-rs 回放/真机）按
 [TOPICS.md](TOPICS.md) 的 topic 契约发数据即可，viewer 用同一份 blueprint 呈现。
@@ -36,7 +37,7 @@ cmake -B build
 # CMake ≥ 4.0 需要兼容开关：Arrow 内嵌的 mimalloc 子构建声明了过旧的 cmake_minimum_required
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cmake --build build -j$(nproc)
 
-# 终端 1 - 默认自动拉起本机 Rerun Viewer
+# 终端 1 - 默认只发布到 Web 观测共享内存，不拉起 Rerun Viewer
 ./build/vision_producer
 ```
 
@@ -46,7 +47,7 @@ Rerun sink 由环境变量选择（按优先级）：
 |---|---|
 | `PULSESCOPE_RERUN_CONNECT=rerun+http://<host>:9876/proxy` | 连接已运行的 viewer（远程部署：机器人上跑 producer，PC 上跑 `rerun --serve`） |
 | `PULSESCOPE_RERUN_SAVE=run1.rrd` | 录制到文件，事后 `rerun run1.rrd` 回放 |
-| （都不设） | spawn 本机 viewer |
+| （都不设） | 不启动 Rerun；实时观测走 Web |
 
 压力工况环境变量：`PULSESCOPE_UPDATE_HZ`（默认 50）、`PULSESCOPE_MAP_HZ`（10）、
 `PULSESCOPE_STRESS_SERIES`（24，最大 512）、`PULSESCOPE_NOISE_LEVEL`（10）。
@@ -55,14 +56,14 @@ Rerun sink 由环境变量选择（按优先级）：
 
 ```bash
 # 终端 2
-cd backend && go run main.go   # 默认监听 127.0.0.1:5000，producer 未启动也能起（惰性挂载 SHM）
+cd backend && go run .   # 默认监听 127.0.0.1:5000，producer 未启动也能起（惰性挂载 SHM）
 ```
 
 默认只绑回环——该端口无鉴权，却能改 `fire_enabled`、SIGTERM 任意进程，不应默认暴露
 在局域网上。需要从其他机器访问（远程面板）时显式放开：
 
 ```bash
-PULSESCOPE_BIND=0.0.0.0:5000 go run main.go
+PULSESCOPE_BIND=0.0.0.0:5000 go run .
 ```
 
 ### 步骤 C: 启动前端控制面板
@@ -70,6 +71,13 @@ PULSESCOPE_BIND=0.0.0.0:5000 go run main.go
 ```bash
 # 终端 3
 npm install && npm run dev     # http://localhost:3000
+```
+
+生产部署也可由一个后端进程服务前端构建产物：
+
+```bash
+npm run build
+cd backend && PULSESCOPE_WEB_DIST=../dist go run .   # http://127.0.0.1:5000
 ```
 
 ## 3. C++ 接口（业务代码接入）
@@ -118,11 +126,15 @@ mon.shutdown();
 | `/api/params` | GET | 当前参数（SHM 实时值） |
 | `/api/control` | POST | 写参数，body 任意字段可省：`{"pid_p":1.2,"pid_i":0.05,"pid_d":0.1,"exposure":5000,"fire_enabled":true}`；返回 clamp 后的生效值 |
 | `/api/status` | GET | producer 心跳年龄/存活、CPU 负载、温度 |
+| `/api/series?max_points=600` | GET | 对齐后的时序数据：`{time, <signal>...}` |
+| `/api/video` | GET | 最新相机画面的 MJPEG 流 |
 | `/api/process/kill` | POST | SIGTERM 目标进程，默认 `{"name":"vision_producer"}` |
 
 参数范围（后端 clamp）：P ∈ [0,10]，I ∈ [0,1]，D ∈ [0,1]，exposure ∈ [100,50000]。
 
-## 5. SHM 控制块（v3）
+## 5. SHM 布局
+
+### 控制块（v3）
 
 `/dev/shm/aurora_rm_ctrl`，4KB 单页，布局见 `include/shm_layout.hpp`：
 
@@ -131,4 +143,10 @@ mon.shutdown();
 - 单字段自然对齐写入，不保证跨字段一致性（调参场景可容忍）；
 - producer 首次启动初始化默认参数；magic/version 有效时不重置——**参数跨重启保留**。
 
-v2 时代的 10MB 数据 SHM（图像/JSON/地图 + seqlock）已整体退役，由 Rerun 取代。
+### 观测块（v4）
+
+`/dev/shm/aurora_rm_obs`，10MB。布局见 `include/shm_layout.hpp`：
+
+- producer 用 seqlock 写入当前 RGBA 帧和 `{key: number}` 标量快照；
+- backend 一致性读取，标量按 frame 去重并补齐缺失值，最多保留 600 个时间点；
+- backend 将视频编码为 JPEG，仅缓存最新一帧，不积压旧帧。

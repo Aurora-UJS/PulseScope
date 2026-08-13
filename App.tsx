@@ -3,17 +3,18 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Activity, AlertCircle, Cpu, ExternalLink, HeartPulse } from 'lucide-react';
 import ParamPanel from './components/ParamPanel';
 import ConsoleLog from './components/ConsoleLog';
+import ObservePanel from './components/ObservePanel';
 import StatusCard from './components/StatusCard';
 import { BackendStatus, ControlParams, LogEntry, LogLevel } from './type';
 
-// 控制面板：参数写回 + 运维（producer 状态 / kill）。
-// 观测面（时序曲线 / 视频 / 地图）在 Rerun Viewer 中查看，不在本页面。
+// Web 实时观测（时序曲线 / 视频）+ 参数写回 + 运维；Rerun 仅用于可选录制与深度分析。
 const App: React.FC = () => {
   const [applied, setApplied] = useState<ControlParams | null>(null);
   const [status, setStatus] = useState<BackendStatus | null>(null);
   const [backendUp, setBackendUp] = useState(false);
   const [isKillingProcess, setIsKillingProcess] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [tab, setTab] = useState<'observe' | 'control'>('observe');
 
   const addLog = useCallback((message: string, level: LogLevel = LogLevel.INFO) => {
     const newLog: LogEntry = {
@@ -121,6 +122,22 @@ const App: React.FC = () => {
         <div className="flex items-center gap-4">
           <h1 className="text-sm font-bold tracking-widest uppercase">PulseScope Control</h1>
           <div className="h-4 w-[1px] bg-slate-700"></div>
+          <nav className="flex items-center gap-1">
+            {(['observe', 'control'] as const).map(t => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`px-3 py-1 rounded text-xs font-bold uppercase tracking-wider transition-all border ${
+                  tab === t
+                    ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
+                    : 'text-slate-500 border-transparent hover:text-slate-300'
+                }`}
+              >
+                {t === 'observe' ? 'Observe' : 'Control'}
+              </button>
+            ))}
+          </nav>
+          <div className="h-4 w-[1px] bg-slate-700"></div>
           <div className={`flex items-center gap-2 text-xs ${producerAlive ? 'text-cyan-400' : 'text-amber-400'}`}>
             <div className={`w-2 h-2 rounded-full animate-pulse ${producerAlive ? 'bg-cyan-400' : 'bg-amber-400'}`}></div>
             {!backendUp ? 'BACKEND_DOWN' : producerAlive ? 'PRODUCER_ALIVE' : 'PRODUCER_OFFLINE'}
@@ -135,6 +152,11 @@ const App: React.FC = () => {
         </button>
       </header>
 
+      {tab === 'observe' ? (
+        <main className="min-h-0 h-[calc(100vh-3.5rem)]">
+          <ObservePanel />
+        </main>
+      ) : (
       <main className="max-w-4xl mx-auto p-6 flex flex-col gap-6">
         <div className="grid grid-cols-3 gap-3">
           <StatusCard
@@ -170,8 +192,8 @@ const App: React.FC = () => {
         <div className="bg-slate-900/40 border border-slate-800/50 rounded-lg p-4 flex items-start gap-3">
           <ExternalLink size={16} className="text-cyan-500 mt-0.5 shrink-0" />
           <p className="text-xs text-slate-400 leading-relaxed">
-            时序曲线、相机画面、ESDF 地图在 <span className="text-cyan-400 font-bold">Rerun Viewer</span> 中查看。
-            producer 默认自动拉起本机 viewer；远程部署时设
+            实时曲线与画面见 <span className="text-cyan-400 font-bold">Observe</span> 页。
+            深度分析 / 回放录制走 Rerun：设
             <code className="text-cyan-500 mx-1">PULSESCOPE_RERUN_CONNECT=rerun+http://&lt;host&gt;:9876/proxy</code>
             连接已运行的 viewer，或设
             <code className="text-cyan-500 mx-1">PULSESCOPE_RERUN_SAVE=xxx.rrd</code>
@@ -184,6 +206,7 @@ const App: React.FC = () => {
           <ConsoleLog logs={logs} />
         </div>
       </main>
+      )}
     </div>
   );
 };
